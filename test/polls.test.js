@@ -3,14 +3,16 @@ import { after, before, test } from "node:test";
 import express from "express";
 
 import Poll from "../src/models/Poll.js";
+import RateBucket from "../src/models/RateBucket.js";
 import pollRoutes from "../src/routes/polls.js";
 
-const original = {
+const originalPollMethods = {
   find: Poll.find,
   aggregate: Poll.aggregate,
   distinct: Poll.distinct,
   countDocuments: Poll.countDocuments,
 };
+const originalRateLimit = RateBucket.findOneAndUpdate;
 const seen = {};
 let server;
 let baseUrl;
@@ -30,8 +32,10 @@ before(async () => {
   Poll.aggregate = async () => [{ activePolls: 5, totalVotes: 23 }];
   Poll.distinct = async () => ["Tech", "Social"];
   Poll.countDocuments = async () => 2;
+  RateBucket.findOneAndUpdate = async () => ({ count: 1 });
 
   const app = express();
+  app.use(express.json());
   app.use("/api/polls", pollRoutes);
   server = app.listen(0, "127.0.0.1");
   await new Promise((resolve) => server.once("listening", resolve));
@@ -40,7 +44,8 @@ before(async () => {
 
 after(async () => {
   await new Promise((resolve) => server.close(resolve));
-  Object.assign(Poll, original);
+  Object.assign(Poll, originalPollMethods);
+  RateBucket.findOneAndUpdate = originalRateLimit;
 });
 
 test("filters and paginates the poll feed", async () => {
@@ -59,4 +64,14 @@ test("filters and paginates the poll feed", async () => {
 test("rejects an invalid page", async () => {
   const response = await fetch(`${baseUrl}/api/polls?page=0`);
   assert.equal(response.status, 400);
+});
+
+test("rejects empty create and vote bodies instead of returning server errors", async () => {
+  for (const path of ["/api/polls", "/api/polls/example/votes"]) {
+    const response = await fetch(`${baseUrl}${path}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+    });
+    assert.equal(response.status, 400);
+  }
 });
