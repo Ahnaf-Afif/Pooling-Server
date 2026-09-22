@@ -21,10 +21,12 @@ Set `MONGODB_URI` (secret, including the database name) and `CLIENT_ORIGINS=http
 ## API
 
 - `GET /api/health` — readiness check
-- `GET /api/polls` — polls and platform statistics
+- `GET /api/polls?category=Tech&trending=true&page=1&limit=12` — filtered, paginated polls, `hasMore`, and platform statistics
 - `GET /api/polls/:slug` — one poll
 - `POST /api/polls` — create a poll
 - `POST /api/polls/:slug/votes` — atomically record a vote
+
+Create and vote requests share a MongoDB-backed limit of 30 writes per IP per minute, including across Vercel instances. Anonymous voting is still a casual-poll model; browser storage only remembers a previous vote for the interface and does not prove a person is unique.
 
 ## Checks
 

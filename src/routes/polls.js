@@ -1,20 +1,12 @@
 import { Router } from "express";
-import rateLimit from "express-rate-limit";
 import mongoose from "mongoose";
 
 import { CATEGORIES } from "../constants.js";
 import Poll from "../models/Poll.js";
+import { limitWrites } from "../rate-limit.js";
 import { createSlug, validatePoll } from "../validation.js";
 
 const router = Router();
-
-const writeLimiter = rateLimit({
-  windowMs: 60 * 1000,
-  limit: 30,
-  standardHeaders: "draft-8",
-  legacyHeaders: false,
-  message: { message: "Too many requests. Please try again in a minute." },
-});
 
 router.get("/", async (request, response, next) => {
   try {
@@ -24,9 +16,17 @@ router.get("/", async (request, response, next) => {
     }
     if (request.query.trending === "true") filter.totalVotes = { $gte: 10 };
 
-    const limit = Math.min(Math.max(Number(request.query.limit) || 50, 1), 100);
+    const requestedLimit = request.query.limit === undefined ? 50 : Number(request.query.limit);
+    const limit = Number.isSafeInteger(requestedLimit) ? Math.min(Math.max(requestedLimit, 1), 100) : 50;
+    const page = request.query.page === undefined ? 1 : Number(request.query.page);
+    if (!Number.isSafeInteger(page) || page < 1 || page > 10000) {
+      return response.status(400).json({ message: "Page must be between 1 and 10000" });
+    }
+    const sort = request.query.trending === "true"
+      ? { totalVotes: -1, createdAt: -1 }
+      : { createdAt: -1, _id: -1 };
     const [polls, totals, categories, trending] = await Promise.all([
-      Poll.find(filter).sort({ totalVotes: -1, createdAt: -1 }).limit(limit),
+      Poll.find(filter).sort(sort).skip((page - 1) * limit).limit(limit + 1),
       Poll.aggregate([
         { $group: { _id: null, activePolls: { $sum: 1 }, totalVotes: { $sum: "$totalVotes" } } },
       ]),
@@ -35,7 +35,8 @@ router.get("/", async (request, response, next) => {
     ]);
 
     response.json({
-      polls,
+      polls: polls.slice(0, limit),
+      hasMore: polls.length > limit,
       stats: {
         activePolls: totals[0]?.activePolls || 0,
         totalVotes: totals[0]?.totalVotes || 0,
@@ -58,7 +59,7 @@ router.get("/:slug", async (request, response, next) => {
   }
 });
 
-router.post("/", writeLimiter, async (request, response, next) => {
+router.post("/", limitWrites, async (request, response, next) => {
   try {
     const { errors, value } = validatePoll(request.body);
     if (errors.length) return response.status(400).json({ message: errors[0], errors });
@@ -75,9 +76,9 @@ router.post("/", writeLimiter, async (request, response, next) => {
   }
 });
 
-router.post("/:slug/votes", writeLimiter, async (request, response, next) => {
+router.post("/:slug/votes", limitWrites, async (request, response, next) => {
   try {
-    const { optionId } = request.body;
+    const optionId = request.body?.optionId;
     if (typeof optionId !== "string" || !mongoose.isValidObjectId(optionId)) {
       return response.status(400).json({ message: "Choose an option" });
     }
@@ -85,7 +86,7 @@ router.post("/:slug/votes", writeLimiter, async (request, response, next) => {
     const poll = await Poll.findOneAndUpdate(
       { slug: request.params.slug, "options._id": optionId },
       { $inc: { "options.$.votes": 1, totalVotes: 1 } },
-      { new: true, runValidators: true },
+      { returnDocument: "after", runValidators: true },
     );
     if (!poll) return response.status(404).json({ message: "Poll or option not found" });
     return response.json({ poll });

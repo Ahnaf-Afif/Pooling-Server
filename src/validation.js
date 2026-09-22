@@ -6,6 +6,7 @@ const normalizeText = (value) =>
   typeof value === "string" ? value.trim().replace(/\s+/g, " ") : "";
 
 export function validatePoll(input = {}) {
+  if (!input || typeof input !== "object" || Array.isArray(input)) input = {};
   const question = normalizeText(input.question);
   const category = normalizeText(input.category);
   const options = Array.isArray(input.options)
@@ -39,6 +40,6 @@ export function createSlug(question) {
     .replace(/[\s-]+/g, "-")
     .slice(0, 55)
     .replace(/-$/, "");
-  const suffix = randomUUID().slice(0, 8);
+  const suffix = randomUUID().replaceAll("-", "").slice(0, 12);
   return `${base || "poll"}-${suffix}`;
 }

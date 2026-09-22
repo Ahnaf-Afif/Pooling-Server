@@ -25,10 +25,16 @@ test("rejects duplicates and incomplete polls", () => {
   assert.equal(result.errors.length, 3);
 });
 
+test("rejects null and non-object poll bodies without crashing", () => {
+  for (const input of [null, [], "poll"]) {
+    assert.ok(validatePoll(input).errors.length > 0);
+  }
+});
+
 test("creates URL-safe unique slugs", () => {
   const first = createSlug("Kacchi or Tehari?");
   const second = createSlug("Kacchi or Tehari?");
 
-  assert.match(first, /^kacchi-or-tehari-[a-f0-9]{8}$/);
+  assert.match(first, /^kacchi-or-tehari-[a-f0-9]{12}$/);
   assert.notEqual(first, second);
 });
