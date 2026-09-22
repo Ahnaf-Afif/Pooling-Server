@@ -1,17 +1,14 @@
 import "dotenv/config";
 import mongoose from "mongoose";
 
-import { createApp } from "./app.js";
+import app from "./app.js";
 import { getConfig } from "./config.js";
+import { connectDatabase } from "./db.js";
 
 const config = getConfig();
+await connectDatabase();
 
-await mongoose.connect(config.mongoUri, {
-  serverSelectionTimeoutMS: 10000,
-  maxPoolSize: 10,
-});
-
-const server = createApp(config.clientOrigins).listen(config.port, () => {
+const server = app.listen(config.port, () => {
   console.log(`API listening on port ${config.port}`);
 });
 server.requestTimeout = 15_000;
