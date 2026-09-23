@@ -10,24 +10,41 @@ cp .env.example .env
 npm run dev
 ```
 
-Set `MONGODB_URI` to an Atlas connection string and list allowed frontend origins in `CLIENT_ORIGINS`.
+Set `MONGODB_URI` to an Atlas connection string and list allowed frontend origins in `CLIENT_ORIGINS`. Better Auth also needs a stable secret, the public frontend URL, and at least one configured sign-in provider. See `.env.example`.
+
+For Google, register these authorized redirect URIs:
+
+```text
+http://localhost:3000/api/auth/callback/google
+https://pooling-client.vercel.app/api/auth/callback/google
+```
+
+For email magic links, verify a sending domain in Resend and set `RESEND_API_KEY` plus `AUTH_EMAIL_FROM`. Set `ADMIN_EMAILS` before the first administrator signs in; `MODERATOR_EMAILS` is optional.
 
 ## Vercel
 
 Vercel discovers `src/app.js` and uses its default Express app export. The separate `src/local.js` starts a listener only for local development.
 
-Set `MONGODB_URI` (secret, including the database name) and `CLIENT_ORIGINS=https://pooling-client.vercel.app` in the Vercel project's **Production** environment. Do not set `PORT` for the Vercel function. Redeploy after changing variables. The database connection is opened on demand and reused by warm function instances.
+Set all server variables from `.env.example` in the Vercel project's **Production** environment. Use `BETTER_AUTH_URL=https://pooling-client.vercel.app` and a unique random `BETTER_AUTH_SECRET` with at least 32 characters. Do not set `PORT` for the Vercel function. Redeploy after changing variables. The database connections are opened on demand and reused by warm function instances.
 
 ## API
 
 - `GET /api/health` — readiness check
+- `/api/auth/*` — Better Auth session, Google OAuth, magic-link, and admin endpoints
+- `GET /api/auth-config` — enabled public sign-in methods (never returns credentials)
 - `GET /api/polls?category=Tech&trending=true&page=1&limit=12` — filtered, paginated polls, `hasMore`, and platform statistics
-- `GET /api/polls?ids=first-slug,second-slug&limit=50` — load a validated set of public polls in one request
 - `GET /api/polls/:slug` — one poll
-- `POST /api/polls` — create a poll
-- `POST /api/polls/:slug/votes` — atomically record a vote
+- `POST /api/polls` — create a poll (verified account required)
+- `GET /api/polls/mine` — polls owned by the current account
+- `PATCH /api/polls/:slug` — edit an owned poll before its first vote
+- `POST /api/polls/:slug/close` — stop new votes
+- `POST /api/polls/:slug/archive` — remove an owned poll from listings
+- `DELETE /api/polls/:slug` — soft-delete an owned poll
+- `POST /api/polls/:slug/votes` — record one vote per signed browser or account
+- `POST /api/polls/:slug/reports` — submit a rate-limited public report
+- `/api/moderation/*` — role-protected report review and enforcement
 
-Create and vote requests share a MongoDB-backed limit of 30 writes per IP per minute, including across Vercel instances. Anonymous voting is still a casual-poll model; browser storage only remembers a previous vote for the interface and does not prove a person is unique.
+Writes use MongoDB-backed rate limits across Vercel instances. Poll creation is limited per account and IP. Anonymous voting uses a signed HttpOnly first-party cookie and a unique database receipt; it prevents repeat votes from the same browser but remains a casual-poll model because cookies, devices, and networks can be changed.
 
 A poll is trending after at least three votes when its most recent vote was within seven days. Popular qualifying polls rank first, with recent activity breaking ties. Older records without an activity timestamp use their creation time during the transition.
 

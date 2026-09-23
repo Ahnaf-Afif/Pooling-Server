@@ -9,14 +9,17 @@
   "scripts": {
     "dev": "node --watch src/local.js",
     "start": "node src/local.js",
-    "lint": "node --check src/local.js && node --check src/app.js && node --check src/db.js && node --check src/models/Poll.js && node --check src/models/RateBucket.js && node --check src/rate-limit.js && node --check src/routes/polls.js",
+    "lint": "node --check src/local.js && node --check src/app.js && node --check src/auth.js && node --check src/auth-middleware.js && node --check src/db.js && node --check src/voter.js && node --check src/models/Poll.js && node --check src/models/RateBucket.js && node --check src/models/Report.js && node --check src/models/VoteReceipt.js && node --check src/rate-limit.js && node --check src/routes/polls.js && node --check src/routes/moderation.js && node --check test/voter.test.js",
     "test": "node --test"
   },
   "dependencies": {
+    "@better-auth/mongo-adapter": "^1.7.5",
+    "better-auth": "^1.7.5",
     "cors": "^2.8.5",
     "dotenv": "^16.6.1",
     "express": "^5.1.0",
     "helmet": "^8.1.0",
+    "mongodb": "^7.6.0",
     "mongoose": "^9.0.0"
   }
 }

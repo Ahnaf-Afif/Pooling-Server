@@ -14,6 +14,7 @@ const pollSchema = new mongoose.Schema(
     slug: { type: String, required: true, unique: true, index: true },
     question: { type: String, required: true, trim: true, maxlength: 240 },
     category: { type: String, required: true, enum: CATEGORIES, index: true },
+    creatorId: { type: String, default: null, index: true },
     options: {
       type: [optionSchema],
       validate: {
@@ -23,6 +24,14 @@ const pollSchema = new mongoose.Schema(
     },
     totalVotes: { type: Number, default: 0, min: 0, index: true },
     lastVotedAt: { type: Date, default: null },
+    status: {
+      type: String,
+      enum: ["active", "closed", "archived"],
+      default: "active",
+      index: true,
+    },
+    closedAt: { type: Date, default: null },
+    deletedAt: { type: Date, default: null, index: true },
   },
   {
     timestamps: true,
@@ -32,6 +41,8 @@ const pollSchema = new mongoose.Schema(
       virtuals: true,
       transform: (_, value) => {
         delete value._id;
+        delete value.creatorId;
+        delete value.deletedAt;
         return value;
       },
     },
@@ -51,5 +62,6 @@ pollSchema.virtual("trending").get(function isTrending() {
 
 pollSchema.index({ createdAt: -1 });
 pollSchema.index({ lastVotedAt: -1, totalVotes: -1 });
+pollSchema.index({ creatorId: 1, createdAt: -1 });
 
 export default mongoose.model("Poll", pollSchema);

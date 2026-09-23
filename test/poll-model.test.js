@@ -27,3 +27,9 @@ test("uses creation time for polls created before activity tracking was added", 
   assert.equal(legacyRecent.trending, true);
   assert.equal(legacyOld.trending, false);
 });
+
+test("does not expose the private owner identifier", () => {
+  const poll = new Poll({ ...basePoll, creatorId: "private-user-id" });
+  assert.equal(poll.toJSON().creatorId, undefined);
+  assert.equal(poll.status, "active");
+});

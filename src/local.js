@@ -1,9 +1,7 @@
 import "dotenv/config";
-import mongoose from "mongoose";
-
 import app from "./app.js";
 import { getConfig } from "./config.js";
-import { connectDatabase } from "./db.js";
+import { closeDatabases, connectDatabase } from "./db.js";
 
 const config = getConfig();
 await connectDatabase();
@@ -20,7 +18,7 @@ async function shutdown(signal) {
   const forceExit = setTimeout(() => process.exit(1), 10_000);
   forceExit.unref();
   server.close(async () => {
-    await mongoose.disconnect();
+    await closeDatabases();
     clearTimeout(forceExit);
     process.exit(0);
   });

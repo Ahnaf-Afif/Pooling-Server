@@ -4,6 +4,7 @@ import express from "express";
 
 import Poll from "../src/models/Poll.js";
 import RateBucket from "../src/models/RateBucket.js";
+import VoteReceipt from "../src/models/VoteReceipt.js";
 import pollRoutes from "../src/routes/polls.js";
 
 const originalPollMethods = {
@@ -14,6 +15,10 @@ const originalPollMethods = {
   findOneAndUpdate: Poll.findOneAndUpdate,
 };
 const originalRateLimit = RateBucket.findOneAndUpdate;
+const originalVoteReceiptMethods = {
+  create: VoteReceipt.create,
+  deleteOne: VoteReceipt.deleteOne,
+};
 const seen = {};
 let server;
 let baseUrl;
@@ -39,9 +44,17 @@ before(async () => {
     return { slug: filter.slug };
   };
   RateBucket.findOneAndUpdate = async () => ({ count: 1 });
+  VoteReceipt.create = async (data) => ({ _id: "receipt-id", ...data });
+  VoteReceipt.deleteOne = async () => ({ deletedCount: 1 });
 
   const app = express();
   app.use(express.json());
+  app.use((request, _response, next) => {
+    request.auth = request.headers["x-test-auth"] === "none"
+      ? { user: null }
+      : { user: { id: "test-user", emailVerified: true } };
+    next();
+  });
   app.use("/api/polls", pollRoutes);
   server = app.listen(0, "127.0.0.1");
   await new Promise((resolve) => server.once("listening", resolve));
@@ -52,6 +65,7 @@ after(async () => {
   await new Promise((resolve) => server.close(resolve));
   Object.assign(Poll, originalPollMethods);
   RateBucket.findOneAndUpdate = originalRateLimit;
+  Object.assign(VoteReceipt, originalVoteReceiptMethods);
 });
 
 test("filters and paginates the poll feed", async () => {
@@ -87,7 +101,10 @@ test("records recent activity whenever a vote is accepted", async () => {
     body: JSON.stringify({ optionId }),
   });
   assert.equal(response.status, 200);
-  assert.deepEqual(seen.voteFilter, { slug: "example-poll", "options._id": optionId });
+  assert.equal(seen.voteFilter.slug, "example-poll");
+  assert.equal(seen.voteFilter["options._id"], optionId);
+  assert.deepEqual(seen.voteFilter.status, { $in: ["active", null] });
+  assert.equal(seen.voteFilter.deletedAt, null);
   assert.ok(seen.voteUpdate.$set.lastVotedAt instanceof Date);
 });
 
@@ -104,4 +121,13 @@ test("rejects empty create and vote bodies instead of returning server errors", 
     });
     assert.equal(response.status, 400);
   }
+});
+
+test("requires authentication before creating a poll", async () => {
+  const response = await fetch(`${baseUrl}/api/polls`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "x-test-auth": "none" },
+    body: JSON.stringify({ question: "A valid question?", category: "Tech", options: ["One", "Two"] }),
+  });
+  assert.equal(response.status, 401);
 });
