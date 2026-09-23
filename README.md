@@ -22,11 +22,14 @@ Set `MONGODB_URI` (secret, including the database name) and `CLIENT_ORIGINS=http
 
 - `GET /api/health` — readiness check
 - `GET /api/polls?category=Tech&trending=true&page=1&limit=12` — filtered, paginated polls, `hasMore`, and platform statistics
+- `GET /api/polls?ids=first-slug,second-slug&limit=50` — load a validated set of public polls in one request
 - `GET /api/polls/:slug` — one poll
 - `POST /api/polls` — create a poll
 - `POST /api/polls/:slug/votes` — atomically record a vote
 
 Create and vote requests share a MongoDB-backed limit of 30 writes per IP per minute, including across Vercel instances. Anonymous voting is still a casual-poll model; browser storage only remembers a previous vote for the interface and does not prove a person is unique.
+
+A poll is trending after at least three votes when its most recent vote was within seven days. Popular qualifying polls rank first, with recent activity breaking ties. Older records without an activity timestamp use their creation time during the transition.
 
 ## Checks
 

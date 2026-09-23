@@ -1,5 +1,5 @@
 import mongoose from "mongoose";
-import { CATEGORIES } from "../constants.js";
+import { CATEGORIES, TRENDING_MIN_VOTES, TRENDING_WINDOW_MS } from "../constants.js";
 
 const optionSchema = new mongoose.Schema(
   {
@@ -22,6 +22,7 @@ const pollSchema = new mongoose.Schema(
       },
     },
     totalVotes: { type: Number, default: 0, min: 0, index: true },
+    lastVotedAt: { type: Date, default: null },
   },
   {
     timestamps: true,
@@ -42,9 +43,13 @@ pollSchema.virtual("id").get(function getId() {
 });
 
 pollSchema.virtual("trending").get(function isTrending() {
-  return this.totalVotes >= 10;
+  const latestActivity = this.lastVotedAt || this.createdAt;
+  return this.totalVotes >= TRENDING_MIN_VOTES &&
+    latestActivity instanceof Date &&
+    latestActivity.getTime() >= Date.now() - TRENDING_WINDOW_MS;
 });
 
 pollSchema.index({ createdAt: -1 });
+pollSchema.index({ lastVotedAt: -1, totalVotes: -1 });
 
 export default mongoose.model("Poll", pollSchema);

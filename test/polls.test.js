@@ -11,6 +11,7 @@ const originalPollMethods = {
   aggregate: Poll.aggregate,
   distinct: Poll.distinct,
   countDocuments: Poll.countDocuments,
+  findOneAndUpdate: Poll.findOneAndUpdate,
 };
 const originalRateLimit = RateBucket.findOneAndUpdate;
 const seen = {};
@@ -32,6 +33,11 @@ before(async () => {
   Poll.aggregate = async () => [{ activePolls: 5, totalVotes: 23 }];
   Poll.distinct = async () => ["Tech", "Social"];
   Poll.countDocuments = async () => 2;
+  Poll.findOneAndUpdate = async (filter, update) => {
+    seen.voteFilter = filter;
+    seen.voteUpdate = update;
+    return { slug: filter.slug };
+  };
   RateBucket.findOneAndUpdate = async () => ({ count: 1 });
 
   const app = express();
@@ -52,13 +58,37 @@ test("filters and paginates the poll feed", async () => {
   const response = await fetch(`${baseUrl}/api/polls?category=Tech&trending=true&limit=2&page=2`);
   assert.equal(response.status, 200);
   const data = await response.json();
-  assert.deepEqual(seen.filter, { category: "Tech", totalVotes: { $gte: 10 } });
-  assert.deepEqual(seen.sort, { totalVotes: -1, createdAt: -1 });
+  assert.equal(seen.filter.category, "Tech");
+  assert.deepEqual(seen.filter.totalVotes, { $gte: 3 });
+  assert.ok(seen.filter.$or[0].lastVotedAt.$gte instanceof Date);
+  assert.ok(seen.filter.$or[1].createdAt.$gte instanceof Date);
+  assert.deepEqual(seen.sort, { totalVotes: -1, lastVotedAt: -1, createdAt: -1 });
   assert.equal(seen.skip, 2);
   assert.equal(seen.limit, 3);
   assert.equal(data.polls.length, 2);
   assert.equal(data.hasMore, true);
   assert.equal(data.stats.activePolls, 5);
+});
+
+test("loads a validated set of browser-owned polls in one request", async () => {
+  const response = await fetch(`${baseUrl}/api/polls?ids=first-poll-a1,second-poll-b2&limit=50`);
+  assert.equal(response.status, 200);
+  assert.deepEqual(seen.filter.slug, { $in: ["first-poll-a1", "second-poll-b2"] });
+
+  const invalid = await fetch(`${baseUrl}/api/polls?ids=not%20a%20slug`);
+  assert.equal(invalid.status, 400);
+});
+
+test("records recent activity whenever a vote is accepted", async () => {
+  const optionId = "507f1f77bcf86cd799439011";
+  const response = await fetch(`${baseUrl}/api/polls/example-poll/votes`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ optionId }),
+  });
+  assert.equal(response.status, 200);
+  assert.deepEqual(seen.voteFilter, { slug: "example-poll", "options._id": optionId });
+  assert.ok(seen.voteUpdate.$set.lastVotedAt instanceof Date);
 });
 
 test("rejects an invalid page", async () => {
