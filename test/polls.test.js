@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { after, before, test } from "node:test";
 import express from "express";
 
+import { closeDatabases } from "../src/db.js";
 import Poll from "../src/models/Poll.js";
 import RateBucket from "../src/models/RateBucket.js";
 import VoteReceipt from "../src/models/VoteReceipt.js";
@@ -12,6 +13,7 @@ const originalPollMethods = {
   aggregate: Poll.aggregate,
   distinct: Poll.distinct,
   countDocuments: Poll.countDocuments,
+  create: Poll.create,
   findOneAndUpdate: Poll.findOneAndUpdate,
 };
 const originalRateLimit = RateBucket.findOneAndUpdate;
@@ -38,6 +40,10 @@ before(async () => {
   Poll.aggregate = async () => [{ activePolls: 5, totalVotes: 23 }];
   Poll.distinct = async () => ["Tech", "Social"];
   Poll.countDocuments = async () => 2;
+  Poll.create = async (data) => {
+    seen.createdPoll = data;
+    return { id: data.slug, ...data };
+  };
   Poll.findOneAndUpdate = async (filter, update) => {
     seen.voteFilter = filter;
     seen.voteUpdate = update;
@@ -50,9 +56,10 @@ before(async () => {
   const app = express();
   app.use(express.json());
   app.use((request, _response, next) => {
-    request.auth = request.headers["x-test-auth"] === "none"
+    const authState = request.headers["x-test-auth"];
+    request.auth = authState === "none"
       ? { user: null }
-      : { user: { id: "test-user", emailVerified: true } };
+      : { user: { id: "test-user", emailVerified: authState !== "unverified" } };
     next();
   });
   app.use("/api/polls", pollRoutes);
@@ -62,10 +69,14 @@ before(async () => {
 });
 
 after(async () => {
-  await new Promise((resolve) => server.close(resolve));
+  await new Promise((resolve) => {
+    server.close(resolve);
+    server.closeAllConnections();
+  });
   Object.assign(Poll, originalPollMethods);
   RateBucket.findOneAndUpdate = originalRateLimit;
   Object.assign(VoteReceipt, originalVoteReceiptMethods);
+  await closeDatabases();
 });
 
 test("filters and paginates the poll feed", async () => {
@@ -84,7 +95,7 @@ test("filters and paginates the poll feed", async () => {
   assert.equal(data.stats.activePolls, 5);
 });
 
-test("loads a validated set of browser-owned polls in one request", async () => {
+test("loads a validated set of polls in one request", async () => {
   const response = await fetch(`${baseUrl}/api/polls?ids=first-poll-a1,second-poll-b2&limit=50`);
   assert.equal(response.status, 200);
   assert.deepEqual(seen.filter.slug, { $in: ["first-poll-a1", "second-poll-b2"] });
@@ -130,4 +141,32 @@ test("requires authentication before creating a poll", async () => {
     body: JSON.stringify({ question: "A valid question?", category: "Tech", options: ["One", "Two"] }),
   });
   assert.equal(response.status, 401);
+});
+
+test("requires a verified email before creating a poll", async () => {
+  const response = await fetch(`${baseUrl}/api/polls`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "x-test-auth": "unverified" },
+    body: JSON.stringify({ question: "A valid question?", category: "Tech", options: ["One", "Two"] }),
+  });
+  assert.equal(response.status, 403);
+});
+
+test("assigns a newly created poll to the signed-in account", async () => {
+  const response = await fetch(`${baseUrl}/api/polls`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ question: "A valid question?", category: "Tech", options: ["One", "Two"] }),
+  });
+  assert.equal(response.status, 201);
+  assert.equal(seen.createdPoll.creatorId, "test-user");
+  assert.deepEqual(seen.createdPoll.options, [{ label: "One" }, { label: "Two" }]);
+});
+
+test("scopes poll management actions to the signed-in owner", async () => {
+  const response = await fetch(`${baseUrl}/api/polls/example-poll/close`, { method: "POST" });
+  assert.equal(response.status, 200);
+  assert.equal(seen.voteFilter.slug, "example-poll");
+  assert.equal(seen.voteFilter.creatorId, "test-user");
+  assert.equal(seen.voteFilter.deletedAt, null);
 });

@@ -61,6 +61,21 @@ const socialProviders = googleConfigured
     }
   : {};
 
+const plugins = [
+  ...(magicLinkConfigured
+    ? [magicLink({
+        expiresIn: 60 * 10,
+        rateLimit: { window: 60, max: 3 },
+        storeToken: "hashed",
+        sendMagicLink,
+      })]
+    : []),
+  admin({
+    defaultRole: "user",
+    bannedUserMessage: "This account is suspended. Contact support if you think this is a mistake.",
+  }),
+];
+
 export const auth = betterAuth({
   appName: "What Do You Think?",
   baseURL: authBaseUrl || "http://localhost:3000",
@@ -100,18 +115,7 @@ export const auth = betterAuth({
       },
     },
   },
-  plugins: [
-    magicLink({
-      expiresIn: 60 * 10,
-      rateLimit: { window: 60, max: 3 },
-      storeToken: "hashed",
-      sendMagicLink,
-    }),
-    admin({
-      defaultRole: "user",
-      bannedUserMessage: "This account is suspended. Contact support if you think this is a mistake.",
-    }),
-  ],
+  plugins,
 });
 
 export function getAuthConfiguration() {

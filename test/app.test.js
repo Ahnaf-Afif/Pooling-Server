@@ -3,6 +3,7 @@ import { after, before, test } from "node:test";
 
 import app from "../src/app.js";
 import { getClientOrigins } from "../src/config.js";
+import { closeDatabases } from "../src/db.js";
 
 let server;
 let baseUrl;
@@ -14,7 +15,11 @@ before(async () => {
 });
 
 after(async () => {
-  await new Promise((resolve) => server.close(resolve));
+  await new Promise((resolve) => {
+    server.close(resolve);
+    server.closeAllConnections();
+  });
+  await closeDatabases();
 });
 
 test("Vercel entrypoint exports an Express app", () => {
