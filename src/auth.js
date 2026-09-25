@@ -1,6 +1,7 @@
 import { mongodbAdapter } from "@better-auth/mongo-adapter";
 import { betterAuth } from "better-auth";
 import { admin, magicLink } from "better-auth/plugins";
+import { adminAc, defaultAc, userAc } from "better-auth/plugins/admin/access";
 
 import { getClientOrigins } from "./config.js";
 import { getMongoClient, getMongoDatabase } from "./db.js";
@@ -25,6 +26,7 @@ const googleConfigured = Boolean(
 const magicLinkConfigured = Boolean(
   process.env.RESEND_API_KEY?.trim() && process.env.AUTH_EMAIL_FROM?.trim(),
 );
+const moderatorAc = defaultAc.newRole({ user: [], session: [] });
 
 async function sendMagicLink({ email, url }) {
   if (!magicLinkConfigured) {
@@ -72,6 +74,8 @@ const plugins = [
     : []),
   admin({
     defaultRole: "user",
+    ac: defaultAc,
+    roles: { user: userAc, moderator: moderatorAc, admin: adminAc },
     bannedUserMessage: "This account is suspended. Contact support if you think this is a mistake.",
   }),
 ];
@@ -123,11 +127,4 @@ export function getAuthConfiguration() {
     google: googleConfigured,
     magicLink: magicLinkConfigured,
   };
-}
-
-export function configuredRoleForEmail(email) {
-  const normalized = String(email || "").toLowerCase();
-  if (adminEmails.has(normalized)) return "admin";
-  if (moderatorEmails.has(normalized)) return "moderator";
-  return null;
 }

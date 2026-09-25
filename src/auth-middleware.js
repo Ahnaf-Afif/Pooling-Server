@@ -1,6 +1,6 @@
 import { fromNodeHeaders } from "better-auth/node";
 
-import { auth, configuredRoleForEmail } from "./auth.js";
+import { auth } from "./auth.js";
 
 export async function readSession(request) {
   if (request.auth) return request.auth;
@@ -35,8 +35,7 @@ export async function requireVerifiedUser(request, response, next) {
 export async function requireModerator(request, response, next) {
   try {
     const session = await readSession(request);
-    const configuredRole = configuredRoleForEmail(session?.user?.email);
-    const roles = String(session?.user?.role || configuredRole || "").split(",");
+    const roles = String(session?.user?.role || "").split(",");
     if (!session?.user || !roles.some((role) => role === "moderator" || role === "admin")) {
       return response.status(403).json({ message: "Moderator access required" });
     }
@@ -50,8 +49,7 @@ export async function requireModerator(request, response, next) {
 export async function requireAdmin(request, response, next) {
   try {
     const session = await readSession(request);
-    const configuredRole = configuredRoleForEmail(session?.user?.email);
-    const roles = String(session?.user?.role || configuredRole || "").split(",");
+    const roles = String(session?.user?.role || "").split(",");
     if (!session?.user || !roles.includes("admin")) {
       return response.status(403).json({ message: "Administrator access required" });
     }
