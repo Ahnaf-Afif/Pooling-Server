@@ -216,6 +216,25 @@ test("moderator edits preserve existing vote data and resolve the report", async
   assert.deepEqual(seen.action.changedFields, ["question", "answer options"]);
 });
 
+test("moderators can directly edit an unreported poll with an audit reason", async () => {
+  const response = await fetch(`${baseUrl}/api/moderation/polls/reported-poll`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json", "x-test-role": "moderator" },
+    body: JSON.stringify({
+      question: "Which reviewed tool do you use?",
+      category: "Tech",
+      options: ["One", "Two"],
+      note: "Corrected the unsafe title",
+    }),
+  });
+  assert.equal(response.status, 200);
+  assert.equal(seen.action.action, "poll_edited");
+  assert.equal(seen.action.reportId, undefined);
+  assert.equal(seen.action.pollSlug, "reported-poll");
+  assert.equal(seen.action.note, "Corrected the unsafe title");
+  assert.equal(seen.pollUpdate.$set.options[0].votes, 3);
+});
+
 test("removing a reported poll also resolves the report and records the decision", async () => {
   const response = await fetch(`${baseUrl}/api/moderation/reports/${reportId}/remove-poll`, {
     method: "POST",

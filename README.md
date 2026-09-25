@@ -43,6 +43,7 @@ Set all server variables from `.env.example` in the Vercel project's **Productio
 - `POST /api/polls/:slug/votes` — record one vote per signed browser or account
 - `POST /api/polls/:slug/reports` — submit a rate-limited public report
 - `GET /api/moderation/reports` — role-protected report queue with internal action history
+- `GET/PATCH /api/moderation/polls/:slug` — load or edit any poll with a required audit reason
 - `POST /api/moderation/reports/:id/notes` — add a private moderation note
 - `PATCH /api/moderation/reports/:id/poll` — edit reported content and resolve the report
 - `POST /api/moderation/reports/:id/remove-poll` — soft-delete the poll and resolve the report

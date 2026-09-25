@@ -65,6 +65,52 @@ function serializeUser(user, history = []) {
   };
 }
 
+function serializePoll(poll) {
+  return {
+    slug: poll.slug,
+    question: poll.question,
+    category: poll.category,
+    options: poll.options.map((option) => ({
+      id: String(option._id),
+      label: option.label,
+      votes: option.votes,
+    })),
+    totalVotes: poll.totalVotes,
+    status: poll.status || "active",
+    creatorId: poll.creatorId || null,
+    deleted: Boolean(poll.deletedAt),
+  };
+}
+
+async function updatePollContent(poll, value) {
+  if (poll.totalVotes > 0 && value.options.length !== poll.options.length) {
+    return { status: 409, error: "Answer options cannot be added or removed after voting has started" };
+  }
+
+  const oldLabels = poll.options.map((option) => option.label);
+  const changedFields = [];
+  if (poll.question !== value.question) changedFields.push("question");
+  if (poll.category !== value.category) changedFields.push("category");
+  if (oldLabels.some((label, index) => label !== value.options[index]) || oldLabels.length !== value.options.length) {
+    changedFields.push("answer options");
+  }
+  if (!changedFields.length) return { status: 400, error: "Change at least one poll field" };
+
+  const options = value.options.map((label, index) => {
+    const existing = poll.options[index];
+    return existing
+      ? { _id: existing._id, label, votes: existing.votes }
+      : { label, votes: 0 };
+  });
+  const updatedPoll = await Poll.findOneAndUpdate(
+    { _id: poll._id, deletedAt: null },
+    { $set: { question: value.question, category: value.category, options } },
+    { returnDocument: "after", runValidators: true },
+  );
+  if (!updatedPoll) return { status: 409, error: "Poll changed while it was being reviewed" };
+  return { updatedPoll, changedFields };
+}
+
 function sendAuthError(error, response, next) {
   if (Number.isInteger(error?.statusCode) && error.statusCode >= 400 && error.statusCode < 500) {
     return response.status(error.statusCode).json({ message: error.body?.message || error.message });
@@ -88,6 +134,49 @@ async function findReport(response, id, { pending = false } = {}) {
   }
   return report;
 }
+
+router.get("/polls/:slug", async (request, response, next) => {
+  try {
+    const poll = await Poll.findOne({ slug: request.params.slug, deletedAt: null });
+    if (!poll) return response.status(404).json({ message: "Poll not found" });
+    const history = await ModerationAction.find({
+      pollSlug: poll.slug,
+      action: "poll_edited",
+    }).sort({ createdAt: -1 }).limit(50).lean();
+    return response.json({ poll: serializePoll(poll), history: history.map(serializeAction) });
+  } catch (error) {
+    return next(error);
+  }
+});
+
+router.patch("/polls/:slug", limitWrites, async (request, response, next) => {
+  try {
+    const { note, error } = cleanNote(request.body, { required: true, minimum: 3 });
+    if (error) return response.status(400).json({ message: error });
+    const { errors, value } = validatePoll(request.body);
+    if (errors.length) return response.status(400).json({ message: errors[0], errors });
+    const poll = await Poll.findOne({ slug: request.params.slug, deletedAt: null });
+    if (!poll) return response.status(404).json({ message: "Poll not found" });
+
+    const result = await updatePollContent(poll, value);
+    if (result.error) return response.status(result.status).json({ message: result.error });
+    const action = await ModerationAction.create({
+      ...actorFrom(request),
+      action: "poll_edited",
+      pollSlug: poll.slug,
+      targetUserId: poll.creatorId || null,
+      note,
+      changedFields: result.changedFields,
+    });
+    return response.json({
+      message: "Poll changes saved",
+      poll: serializePoll(result.updatedPoll),
+      action: serializeAction(action),
+    });
+  } catch (error) {
+    return next(error);
+  }
+});
 
 router.get("/reports", async (request, response, next) => {
   try {
@@ -120,21 +209,7 @@ router.get("/reports", async (request, response, next) => {
           status: report.status,
           createdAt: report.createdAt,
           history: actionsByReport.get(String(report._id)) || [],
-          poll: poll
-            ? {
-                question: poll.question,
-                category: poll.category,
-                options: poll.options.map((option) => ({
-                  id: String(option._id),
-                  label: option.label,
-                  votes: option.votes,
-                })),
-                totalVotes: poll.totalVotes,
-                status: poll.status || "active",
-                creatorId: poll.creatorId || null,
-                deleted: Boolean(poll.deletedAt),
-              }
-            : null,
+          poll: poll ? serializePoll(poll) : null,
         };
       }),
     });
@@ -203,33 +278,8 @@ router.patch("/reports/:id/poll", limitWrites, async (request, response, next) =
     if (!report) return undefined;
     const poll = await Poll.findOne({ slug: report.pollSlug, deletedAt: null });
     if (!poll) return response.status(404).json({ message: "Poll not found" });
-    if (poll.totalVotes > 0 && value.options.length !== poll.options.length) {
-      return response.status(409).json({
-        message: "Answer options cannot be added or removed after voting has started",
-      });
-    }
-
-    const oldLabels = poll.options.map((option) => option.label);
-    const changedFields = [];
-    if (poll.question !== value.question) changedFields.push("question");
-    if (poll.category !== value.category) changedFields.push("category");
-    if (oldLabels.some((label, index) => label !== value.options[index]) || oldLabels.length !== value.options.length) {
-      changedFields.push("answer options");
-    }
-    if (!changedFields.length) return response.status(400).json({ message: "Change at least one poll field" });
-
-    const options = value.options.map((label, index) => {
-      const existing = poll.options[index];
-      return existing
-        ? { _id: existing._id, label, votes: existing.votes }
-        : { label, votes: 0 };
-    });
-    const updatedPoll = await Poll.findOneAndUpdate(
-      { _id: poll._id, deletedAt: null },
-      { $set: { question: value.question, category: value.category, options } },
-      { returnDocument: "after", runValidators: true },
-    );
-    if (!updatedPoll) return response.status(409).json({ message: "Poll changed while it was being reviewed" });
+    const result = await updatePollContent(poll, value);
+    if (result.error) return response.status(result.status).json({ message: result.error });
 
     report.status = "resolved";
     report.reviewedBy = request.auth.user.id;
@@ -242,7 +292,7 @@ router.patch("/reports/:id/poll", limitWrites, async (request, response, next) =
       pollSlug: report.pollSlug,
       targetUserId: poll.creatorId || null,
       note,
-      changedFields,
+      changedFields: result.changedFields,
     });
     return response.json({ message: "Poll edited and report resolved" });
   } catch (error) {
