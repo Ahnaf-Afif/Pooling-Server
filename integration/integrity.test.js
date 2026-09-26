@@ -1,9 +1,10 @@
 import assert from "node:assert/strict";
 import { after, before, beforeEach, test } from "node:test";
 import { ObjectId } from "mongodb";
-import { makeSignature, symmetricDecrypt } from "better-auth/crypto";
+import { makeSignature, symmetricDecrypt, symmetricEncrypt } from "better-auth/crypto";
 import { createOTP } from "@better-auth/utils/otp";
 import { MongoMemoryReplSet } from "mongodb-memory-server";
+import { rotateAuthEncryption } from "../src/services/auth-encryption.js";
 
 // Always create an isolated local replica set. Never read .env or reuse Atlas.
 let replicaSet, server, baseUrl, database, auth, closeDatabases, withDatabaseTransaction;
@@ -22,6 +23,7 @@ before(async () => {
   process.env.MONGODB_URI = replicaSet.getUri("wdyt_integration");
   process.env.NODE_ENV = "test";
   process.env.BETTER_AUTH_SECRET = secret;
+  process.env.VOTER_SECRET = secret;
   process.env.BETTER_AUTH_URL = "http://localhost:3000";
   delete process.env.BETTER_AUTH_SECRETS;
   delete process.env.RESEND_API_KEY;
@@ -279,4 +281,98 @@ test("required-index verification detects drift and migration repairs it", async
   await syncIndexes({ apply: true });
   await verifyIndexes();
   assert.equal(await database.collection("migrations").countDocuments({}), 1);
+});
+
+test("auth secret rotation preserves duplicate protection, export and deletion of existing votes", async () => {
+  const user = await createUser();
+  const poll = await createPoll();
+  const path = `/api/polls/${poll.slug}/votes`;
+  const body = { optionId: String(poll.options[0]._id) };
+  assert.equal((await post(path, user.cookie, body)).status, 200);
+  const original = process.env.BETTER_AUTH_SECRET;
+  try {
+    process.env.BETTER_AUTH_SECRET = "rotated-auth-signing-key-test-only-0123456789";
+    assert.equal((await post(path, user.cookie, body)).status, 409);
+    assert.equal((await Poll.findById(poll._id)).totalVotes, 1);
+    const exported = await fetch(`${baseUrl}/api/account/export`, { headers: { Cookie: user.cookie } });
+    assert.equal(exported.status, 200);
+    assert.equal((await exported.json()).votes.length, 1);
+    const { getAccountVoterKey } = await import("../src/voter.js");
+    const key = getAccountVoterKey(user.id);
+    assert.equal((await post("/api/account/delete", user.cookie, { confirmation: "DELETE" })).status, 204);
+    assert.equal(await VoteReceipt.countDocuments({ voterKey: key }), 0);
+    assert.equal(await VoteReceipt.countDocuments({}), 1);
+  } finally { process.env.BETTER_AUTH_SECRET = original; }
+});
+
+function rotationKeys() {
+  const previous = { currentVersion: 1, keys: new Map([[1, secret]]), legacySecret: secret };
+  const current = { currentVersion: 2, keys: new Map([[2, "new-encryption-key-test-only-0123456789"], [1, secret]]), legacySecret: secret };
+  return { previous, current };
+}
+
+test("rotation upgrades OAuth, legacy ciphertext, TOTP and recovery codes without changing their values", async () => {
+  const { previous, current } = rotationKeys();
+  const account = {
+    providerId: "google", accountId: "rotation-test",
+    accessToken: await symmetricEncrypt({ key: previous, data: "test-access" }),
+    refreshToken: await symmetricEncrypt({ key: secret, data: "test-refresh" }),
+    idToken: await symmetricEncrypt({ key: current, data: "test-id" }),
+  };
+  const factor = {
+    userId: new ObjectId(),
+    secret: await symmetricEncrypt({ key: previous, data: "test-totp" }),
+    backupCodes: await symmetricEncrypt({ key: previous, data: '["test-unused-code"]' }),
+  };
+  await database.collection("account").insertOne(account);
+  await database.collection("twoFactor").insertOne(factor);
+  const dryRun = await rotateAuthEncryption(database, current);
+  assert.equal(dryRun.outdated, 4);
+  assert.equal(dryRun.changed, 0);
+  assert.equal((await database.collection("account").findOne({})).accessToken, account.accessToken);
+  await assert.rejects(() => rotateAuthEncryption(database, current, { verify: true }), /4 encrypted fields/);
+  const applied = await rotateAuthEncryption(database, current, { apply: true });
+  assert.equal(applied.changed, 4);
+  assert.equal(applied.outdated, 0);
+  const retired = { currentVersion: 2, keys: new Map([[2, current.keys.get(2)]]) };
+  for (const [collection, expected] of [
+    ["account", { accessToken: "test-access", refreshToken: "test-refresh", idToken: "test-id" }],
+    ["twoFactor", { secret: "test-totp", backupCodes: '["test-unused-code"]' }],
+  ]) {
+    const document = await database.collection(collection).findOne({});
+    for (const [field, value] of Object.entries(expected)) {
+      assert.equal(await symmetricDecrypt({ key: retired, data: document[field] }), value);
+    }
+  }
+  await rotateAuthEncryption(database, retired, { verify: true });
+  assert.equal((await rotateAuthEncryption(database, retired, { apply: true })).changed, 0);
+});
+
+test("rotation preflight leaves all records untouched if any ciphertext cannot be decrypted", async () => {
+  const { previous, current } = rotationKeys();
+  const token = await symmetricEncrypt({ key: previous, data: "valid-test-token" });
+  await database.collection("account").insertOne({ providerId: "google", accountId: "preflight-test", accessToken: token });
+  await database.collection("twoFactor").insertOne({ userId: new ObjectId(), secret: "$ba$99$unknown-key" });
+  await assert.rejects(() => rotateAuthEncryption(database, current, { apply: true }), /Cannot decrypt twoFactor.secret/);
+  assert.equal((await database.collection("account").findOne({})).accessToken, token);
+});
+
+test("rotation never overwrites a concurrently refreshed OAuth token", async () => {
+  const { previous, current } = rotationKeys();
+  const collection = database.collection("account");
+  await collection.insertOne({ providerId: "google", accountId: "concurrency-test", accessToken: await symmetricEncrypt({ key: previous, data: "old-test-token" }) });
+  const refreshed = await symmetricEncrypt({ key: current, data: "new-test-token" });
+  const concurrentDatabase = { collection(name) {
+    if (name !== "account") return database.collection(name);
+    return {
+      find: (...args) => collection.find(...args),
+      async updateOne(filter, update) {
+        await collection.updateOne({ _id: filter._id }, { $set: { accessToken: refreshed } });
+        return collection.updateOne(filter, update);
+      },
+    };
+  } };
+  await assert.rejects(() => rotateAuthEncryption(concurrentDatabase, current, { apply: true }), /Concurrent auth updates/);
+  assert.equal((await collection.findOne({})).accessToken, refreshed);
+  await rotateAuthEncryption(database, current, { verify: true });
 });

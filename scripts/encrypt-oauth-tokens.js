@@ -36,7 +36,11 @@ try {
     }
     if (!Object.keys(encrypted).length) continue;
     accountCount += 1;
-    if (apply) await accounts.updateOne({ _id: account._id }, { $set: encrypted });
+    if (apply) {
+      const expected = Object.fromEntries(Object.keys(encrypted).map((field) => [field, account[field]]));
+      const result = await accounts.updateOne({ _id: account._id, ...expected }, { $set: encrypted });
+      if (!result.matchedCount) throw new Error("An OAuth token changed during migration; rerun without removing any old keys");
+    }
   }
 
   console.log(`${apply ? "Encrypted" : "Found"} ${tokenCount} OAuth token fields across ${accountCount} accounts`);

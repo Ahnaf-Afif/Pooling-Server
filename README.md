@@ -12,6 +12,11 @@ npm run dev
 
 Set `MONGODB_URI` to an Atlas connection string and list allowed frontend origins in `CLIENT_ORIGINS`. Better Auth also needs a stable secret, the public frontend URL, and at least one configured sign-in provider. See `.env.example`.
 
+Production also requires `VOTER_SECRET`. Before upgrading an existing database,
+pin it to the previous auth secret used for voting; do not generate a replacement.
+For a new empty database use an independent random secret. Follow
+[SECRET-ROTATION.md](SECRET-ROTATION.md) before changing any production keys.
+
 For Google, register these authorized redirect URIs:
 
 ```text

@@ -3,16 +3,22 @@ import { createHmac, randomUUID, timingSafeEqual } from "node:crypto";
 const COOKIE_NAME = "wdyt_voter";
 const ONE_YEAR_SECONDS = 60 * 60 * 24 * 365;
 
-function secret() {
-  return process.env.BETTER_AUTH_SECRET?.trim() || "development-only-secret-change-before-production-1234";
+export function getVoterSecret() {
+  const configured = process.env.VOTER_SECRET?.trim();
+  if (configured && configured.length < 32) throw new Error("VOTER_SECRET must contain at least 32 characters");
+  if (!configured && process.env.NODE_ENV === "production") {
+    throw new Error("VOTER_SECRET is required in production; preserve the existing voter key before rotating auth secrets");
+  }
+  // Local development stays compatible with existing local vote receipts.
+  return configured || process.env.BETTER_AUTH_SECRET?.trim() || "development-only-secret-change-before-production-1234";
 }
 
 function signature(value) {
-  return createHmac("sha256", secret()).update(value).digest("base64url");
+  return createHmac("sha256", getVoterSecret()).update(value).digest("base64url");
 }
 
 export function getAccountVoterKey(userId) {
-  return createHmac("sha256", secret()).update(`user:${userId}`).digest("hex");
+  return createHmac("sha256", getVoterSecret()).update(`user:${userId}`).digest("hex");
 }
 
 function parseCookies(header = "") {
@@ -51,7 +57,7 @@ export function getVoterKey(request, response, session) {
   const identity = session?.user?.id
     ? `user:${session.user.id}`
     : `anonymous:${readSignedVoter(request) || createAnonymousVoter(response)}`;
-  return createHmac("sha256", secret()).update(identity).digest("hex");
+  return createHmac("sha256", getVoterSecret()).update(identity).digest("hex");
 }
 
 function createAnonymousVoter(response) {

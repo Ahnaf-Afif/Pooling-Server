@@ -11,5 +11,6 @@ const voteReceiptSchema = new mongoose.Schema(
 
 voteReceiptSchema.index({ pollSlug: 1, voterKey: 1 }, { unique: true });
 voteReceiptSchema.index({ createdAt: 1 });
+voteReceiptSchema.index({ voterKey: 1, createdAt: 1 });
 
 export default mongoose.model("VoteReceipt", voteReceiptSchema);

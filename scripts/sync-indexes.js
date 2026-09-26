@@ -9,7 +9,7 @@ import VoteReceipt from "../src/models/VoteReceipt.js";
 import AdminGuard from "../src/models/AdminGuard.js";
 
 const models = [Poll, VoteReceipt, Report, ModerationAction, RateBucket, AdminGuard];
-const migrationId = "2026-09-security-indexes-v2";
+const migrationId = "2026-09-voter-lookup-v3";
 
 const nativeIndexes = {
   user: [

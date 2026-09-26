@@ -5,6 +5,11 @@ import { defaultAc, userAc } from "better-auth/plugins/admin/access";
 
 import { getClientOrigins } from "./config.js";
 import { getMongoClient, getMongoDatabase } from "./db.js";
+import { getVoterSecret } from "./voter.js";
+import { parseAuthSecrets } from "./auth-secrets.js";
+
+// Validate before serving any requests, not only on the first vote.
+getVoterSecret();
 
 const splitList = (value) => new Set(
   String(value || "")
@@ -54,23 +59,6 @@ const disabledAdminPaths = [
   "/two-factor/verify-totp", "/two-factor/verify-backup-code",
   "/two-factor/generate-backup-codes", "/two-factor/send-otp", "/two-factor/verify-otp",
 ];
-
-function getVersionedSecrets() {
-  const configured = process.env.BETTER_AUTH_SECRETS?.trim();
-  if (!configured) return [{ version: 1, value: authSecret || "development-only-secret-change-before-production-1234" }];
-
-  let secrets;
-  try {
-    secrets = JSON.parse(configured);
-  } catch {
-    throw new Error("BETTER_AUTH_SECRETS must be a JSON array of versioned secrets");
-  }
-  if (!Array.isArray(secrets) || !secrets.length || secrets.some(({ version, value } = {}) =>
-    !Number.isSafeInteger(version) || version < 1 || typeof value !== "string" || value.length < 32)) {
-    throw new Error("BETTER_AUTH_SECRETS contains an invalid version or secret");
-  }
-  return secrets;
-}
 
 async function sendMagicLink({ email, url }) {
   if (!magicLinkConfigured) {
@@ -129,7 +117,7 @@ export const auth = betterAuth({
   appName: "What Do You Think?",
   baseURL: authBaseUrl || "http://localhost:3000",
   secret: authSecret || "development-only-secret-change-before-production-1234",
-  secrets: getVersionedSecrets(),
+  secrets: parseAuthSecrets(process.env.BETTER_AUTH_SECRETS, authSecret || "development-only-secret-change-before-production-1234"),
   database: mongodbAdapter(getMongoDatabase(), { client: getMongoClient() }),
   trustedOrigins: getClientOrigins(),
   disabledPaths: disabledAdminPaths,

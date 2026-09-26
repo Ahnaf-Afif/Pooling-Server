@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { getVoterKey } from "../src/voter.js";
+import { getAccountVoterKey, getVoterKey, getVoterSecret } from "../src/voter.js";
 
 function responseRecorder() {
   return {
@@ -51,5 +51,45 @@ test("malformed, tampered and non-ASCII cookies are replaced safely", () => {
     const key = getVoterKey({ headers: { cookie: `wdyt_voter=${encodeURIComponent(value)}` } }, response, null);
     assert.ok(response.cookieValue);
     assert.notEqual(key, originalKey);
+  }
+});
+
+test("pinning the legacy voter secret preserves receipts and cookies across auth rotation", () => {
+  const saved = { ...process.env };
+  try {
+    process.env.NODE_ENV = "test";
+    delete process.env.VOTER_SECRET;
+    process.env.BETTER_AUTH_SECRET = "old-auth-secret-for-voter-migration-test-only";
+    const legacyAccount = getAccountVoterKey("existing-user");
+    const firstResponse = responseRecorder();
+    const legacyGuest = getVoterKey({ headers: {} }, firstResponse, null);
+    process.env.VOTER_SECRET = process.env.BETTER_AUTH_SECRET;
+    process.env.BETTER_AUTH_SECRET = "new-auth-secret-for-voter-migration-test-only";
+    process.env.NODE_ENV = "production";
+    assert.equal(getAccountVoterKey("existing-user"), legacyAccount);
+    const response = responseRecorder();
+    assert.equal(getVoterKey({ headers: { cookie: `wdyt_voter=${firstResponse.cookieValue}` } }, response, null), legacyGuest);
+    assert.equal(response.cookieValue, null);
+  } finally {
+    for (const name of ["NODE_ENV", "VOTER_SECRET", "BETTER_AUTH_SECRET"]) {
+      if (saved[name] === undefined) delete process.env[name];
+      else process.env[name] = saved[name];
+    }
+  }
+});
+
+test("production cannot silently fall back to the rotating auth key", () => {
+  const saved = { NODE_ENV: process.env.NODE_ENV, VOTER_SECRET: process.env.VOTER_SECRET };
+  try {
+    process.env.NODE_ENV = "production";
+    delete process.env.VOTER_SECRET;
+    assert.throws(getVoterSecret, /VOTER_SECRET is required/);
+    process.env.VOTER_SECRET = "too-short";
+    assert.throws(getVoterSecret, /at least 32/);
+  } finally {
+    for (const [name, value] of Object.entries(saved)) {
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
   }
 });
