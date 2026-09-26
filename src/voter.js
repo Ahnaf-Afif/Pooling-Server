@@ -11,6 +11,10 @@ function signature(value) {
   return createHmac("sha256", secret()).update(value).digest("base64url");
 }
 
+export function getAccountVoterKey(userId) {
+  return createHmac("sha256", secret()).update(`user:${userId}`).digest("hex");
+}
+
 function parseCookies(header = "") {
   return Object.fromEntries(
     header.split(";").map((part) => {

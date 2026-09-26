@@ -37,6 +37,13 @@ test("root responds without a database connection", async () => {
   assert.equal((await response.json()).health, "/api/health");
 });
 
+test("liveness responds without a database connection and carries a request id", async () => {
+  const response = await fetch(`${baseUrl}/api/health/live`, { headers: { "x-request-id": "health-check-1" } });
+  assert.equal(response.status, 200);
+  assert.equal(response.headers.get("x-request-id"), "health-check-1");
+  assert.deepEqual(await response.json(), { status: "ok", requestId: "health-check-1" });
+});
+
 test("production frontend origin is allowed by default", async () => {
   const response = await fetch(baseUrl, {
     headers: { Origin: "https://pooling-client.vercel.app" },

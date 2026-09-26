@@ -33,6 +33,7 @@ function createLimiter({ prefix, windowMs, max, message, keys }) {
       response.set("RateLimit-Reset", String(Math.ceil(remainingMs / 1000)));
 
       if (highestCount > max) {
+        response.set("Retry-After", String(Math.max(1, Math.ceil(remainingMs / 1000))));
         return response.status(429).json({ message });
       }
       return next();

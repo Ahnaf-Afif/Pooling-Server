@@ -65,5 +65,7 @@ pollSchema.virtual("trending").get(function isTrending() {
 pollSchema.index({ createdAt: -1 });
 pollSchema.index({ lastVotedAt: -1, totalVotes: -1 });
 pollSchema.index({ creatorId: 1, createdAt: -1 });
+pollSchema.index({ deletedAt: 1, status: 1, category: 1, createdAt: -1 });
+pollSchema.index({ deletedAt: 1, status: 1, totalVotes: -1, lastVotedAt: -1, createdAt: -1 });
 
 export default mongoose.model("Poll", pollSchema);

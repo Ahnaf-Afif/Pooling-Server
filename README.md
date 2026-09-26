@@ -50,11 +50,15 @@ Set all server variables from `.env.example` in the Vercel project's **Productio
 - `GET /api/moderation/users` — administrator-only, searchable account list
 - `PATCH /api/moderation/users/:id/role` — assign a persistent user, moderator, or admin role
 - `POST /api/moderation/users/:id/suspend` — suspend an account and revoke its sessions
+- `GET /api/account/export` — download the signed-in account's data
+- `POST /api/account/delete` — permanently delete the signed-in account after typed confirmation
 - `POST /api/moderation/users/:id/reactivate` — restore a suspended account
 
 Report decisions, content edits, role changes, suspensions, and reactivations are recorded in an internal audit history. Administrators cannot suspend themselves or change their own role through the dashboard, which prevents accidental lockout.
 
 Writes use MongoDB-backed rate limits across Vercel instances. Poll creation is limited per account and IP. Anonymous voting uses a signed HttpOnly first-party cookie and a unique database receipt; it prevents repeat votes from the same browser but remains a casual-poll model because cookies, devices, and networks can be changed.
+
+Run `npm run db:indexes -- --apply` once after deploying schema changes to synchronize production indexes. Run `npm run db:encrypt-oauth -- --apply` once after deploying Better Auth token encryption; both commands are dry-run by default. Better Auth's numeric rate-limit records are pruned opportunistically every hour on a warm API instance, while application rate buckets use a MongoDB TTL index.
 
 A poll is trending after at least three votes when its most recent vote was within seven days. Popular qualifying polls rank first, with recent activity breaking ties. Older records without an activity timestamp use their creation time during the transition.
 

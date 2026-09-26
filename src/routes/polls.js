@@ -75,6 +75,7 @@ router.get("/", async (request, response, next) => {
       Poll.countDocuments(trendingFilter),
     ]);
 
+    response.set("Cache-Control", "public, max-age=10, stale-while-revalidate=30");
     return response.json({
       polls: polls.slice(0, limit),
       hasMore: polls.length > limit,
@@ -92,10 +93,17 @@ router.get("/", async (request, response, next) => {
 
 router.get("/mine", requireVerifiedUser, async (request, response, next) => {
   try {
+    const requestedLimit = request.query.limit === undefined ? 24 : Number(request.query.limit);
+    const limit = Number.isSafeInteger(requestedLimit) ? Math.min(Math.max(requestedLimit, 1), 50) : 24;
+    const page = request.query.page === undefined ? 1 : Number(request.query.page);
+    if (!Number.isSafeInteger(page) || page < 1 || page > 10000) {
+      return response.status(400).json({ message: "Page must be between 1 and 10000" });
+    }
     const polls = await Poll.find({ creatorId: request.auth.user.id, ...notDeleted })
       .sort({ createdAt: -1 })
-      .limit(100);
-    return response.json({ polls });
+      .skip((page - 1) * limit)
+      .limit(limit + 1);
+    return response.json({ polls: polls.slice(0, limit), page, hasMore: polls.length > limit });
   } catch (error) {
     return next(error);
   }
@@ -115,6 +123,7 @@ router.get("/:slug", async (request, response, next) => {
   try {
     const poll = await Poll.findOne({ slug: request.params.slug, ...notDeleted });
     if (!poll) return response.status(404).json({ message: "Poll not found" });
+    response.set("Cache-Control", "public, max-age=5, stale-while-revalidate=15");
     return response.json({ poll });
   } catch (error) {
     return next(error);
