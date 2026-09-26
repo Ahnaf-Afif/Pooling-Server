@@ -483,3 +483,27 @@ test("newest feed cursors use ordered indexes rather than scanning previous page
     assert.ok(explanation.executionStats.totalDocsExamined <= 40, `examined ${explanation.executionStats.totalDocsExamined} records for 11 results`);
   }
 });
+
+test("account export requires recent sign-in or session-scoped MFA verification", async () => {
+  const user = await createUser();
+  const exportData = () => fetch(`${baseUrl}/api/account/export`, { headers: { Cookie: user.cookie } });
+  assert.equal((await exportData()).status, 200);
+  const sessions = { userId: { $in: [user.id, user._id] } };
+  const aged = await database.collection("session").updateMany(sessions, { $set: { createdAt: new Date(Date.now() - 16 * 60_000) } });
+  assert.equal(aged.modifiedCount, 1);
+  const stale = await exportData();
+  assert.equal(stale.status, 403);
+  assert.equal((await stale.json()).code, "REAUTH_REQUIRED");
+  await database.collection("user").updateOne({ _id: user._id }, { $set: { twoFactorEnabled: true } });
+  assert.equal((await exportData()).status, 403);
+  await database.collection("session").updateMany(sessions, { $set: { mfaVerifiedAt: new Date() } });
+  const verified = await exportData();
+  assert.equal(verified.status, 200);
+  assert.equal(verified.headers.get("cache-control"), "no-store");
+  assert.equal((await verified.json()).account.id, user.id);
+  const context = await auth.$context;
+  const otherSession = await context.internalAdapter.createSession(user.id, false);
+  const signed = `${otherSession.token}.${await makeSignature(otherSession.token, secret)}`;
+  const otherDevice = await fetch(`${baseUrl}/api/account/export`, { headers: { Cookie: `better-auth.session_token=${encodeURIComponent(signed)}` } });
+  assert.equal(otherDevice.status, 403, "verification must not carry over to another device");
+});

@@ -55,7 +55,7 @@ Set all server variables from `.env.example` in the Vercel project's **Productio
 - `GET /api/moderation/users` — administrator-only, searchable account list
 - `PATCH /api/moderation/users/:id/role` — assign a persistent user, moderator, or admin role
 - `POST /api/moderation/users/:id/suspend` — suspend an account and revoke its sessions
-- `GET /api/account/export` — download the signed-in account's data
+- `GET /api/account/export` — download account data after recent sign-in or authenticator verification
 - `POST /api/account/delete` — permanently delete the signed-in account after typed confirmation
 - `POST /api/moderation/users/:id/reactivate` — restore a suspended account
 

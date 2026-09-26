@@ -25,7 +25,7 @@ router.use((_request, response, next) => {
 });
 router.use(requireVerifiedUser);
 
-router.get("/export", async (request, response, next) => {
+router.get("/export", requireRecentAuth, async (request, response, next) => {
   try {
     const userId = request.auth.user.id;
     const voterKey = getAccountVoterKey(userId);
