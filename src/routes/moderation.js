@@ -21,6 +21,7 @@ const router = Router();
 const REPORT_STATUSES = ["pending", "resolved", "dismissed"];
 const MANAGED_REPORT_STATUSES = ["pending", "dismissed"];
 const USER_ROLES = ["user", "moderator", "admin"];
+const MAX_PAGE = 1000;
 
 router.use(requireModerator);
 
@@ -266,8 +267,8 @@ router.get("/reports", async (request, response, next) => {
   try {
     const status = REPORT_STATUSES.includes(request.query.status) ? request.query.status : "pending";
     const page = Number(request.query.page || 1);
-    if (!Number.isSafeInteger(page) || page < 1 || page > 10000) {
-      return response.status(400).json({ message: "Page must be between 1 and 10000" });
+    if (!Number.isSafeInteger(page) || page < 1 || page > MAX_PAGE) {
+      return response.status(400).json({ message: `Page must be between 1 and ${MAX_PAGE}` });
     }
     const limit = 25;
     const [reports, total] = await Promise.all([
@@ -474,8 +475,8 @@ router.get("/users", requireAdmin, async (request, response, next) => {
     const page = Number(request.query.page || 1);
     const searchField = request.query.field === "email" ? "email" : "name";
     const searchValue = typeof request.query.q === "string" ? request.query.q.trim().slice(0, 160) : "";
-    if (!Number.isSafeInteger(page) || page < 1 || page > 10000) {
-      return response.status(400).json({ message: "Page must be between 1 and 10000" });
+    if (!Number.isSafeInteger(page) || page < 1 || page > MAX_PAGE) {
+      return response.status(400).json({ message: `Page must be between 1 and ${MAX_PAGE}` });
     }
     const limit = 20;
     const result = await listAuthUsers({ page, limit, searchField, searchValue });

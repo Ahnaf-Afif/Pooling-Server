@@ -132,6 +132,8 @@ test("records recent activity whenever a vote is accepted", async () => {
 test("rejects an invalid page", async () => {
   const response = await fetch(`${baseUrl}/api/polls?page=0`);
   assert.equal(response.status, 400);
+  const excessive = await fetch(`${baseUrl}/api/polls?page=1001`);
+  assert.equal(excessive.status, 400);
 });
 
 test("rejects empty create and vote bodies instead of returning server errors", async () => {

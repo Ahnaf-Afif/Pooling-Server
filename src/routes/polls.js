@@ -14,6 +14,7 @@ import { getVoterKey } from "../voter.js";
 const router = Router();
 const notDeleted = { deletedAt: null };
 const activeStatus = { $in: ["active", null] };
+const MAX_PAGE = 1000;
 
 class VoteRejectedError extends Error {
   constructor(message, status) {
@@ -59,8 +60,8 @@ router.get("/", async (request, response, next) => {
     const requestedLimit = request.query.limit === undefined ? 50 : Number(request.query.limit);
     const limit = Number.isSafeInteger(requestedLimit) ? Math.min(Math.max(requestedLimit, 1), 100) : 50;
     const page = request.query.page === undefined ? 1 : Number(request.query.page);
-    if (!Number.isSafeInteger(page) || page < 1 || page > 10000) {
-      return response.status(400).json({ message: "Page must be between 1 and 10000" });
+    if (!Number.isSafeInteger(page) || page < 1 || page > MAX_PAGE) {
+      return response.status(400).json({ message: `Page must be between 1 and ${MAX_PAGE}` });
     }
     const sort = request.query.trending === "true"
       ? { totalVotes: -1, lastVotedAt: -1, createdAt: -1 }
@@ -96,8 +97,8 @@ router.get("/mine", requireVerifiedUser, async (request, response, next) => {
     const requestedLimit = request.query.limit === undefined ? 24 : Number(request.query.limit);
     const limit = Number.isSafeInteger(requestedLimit) ? Math.min(Math.max(requestedLimit, 1), 50) : 24;
     const page = request.query.page === undefined ? 1 : Number(request.query.page);
-    if (!Number.isSafeInteger(page) || page < 1 || page > 10000) {
-      return response.status(400).json({ message: "Page must be between 1 and 10000" });
+    if (!Number.isSafeInteger(page) || page < 1 || page > MAX_PAGE) {
+      return response.status(400).json({ message: `Page must be between 1 and ${MAX_PAGE}` });
     }
     const polls = await Poll.find({ creatorId: request.auth.user.id, ...notDeleted })
       .sort({ createdAt: -1 })
