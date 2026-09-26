@@ -439,29 +439,31 @@ router.post("/reports/:id/suspend-owner", requireAdmin, limitWrites, async (requ
   try {
     const { note, error } = cleanNote(request.body);
     if (error) return response.status(400).json({ message: error });
-    const report = await findReport(response, request.params.id, { pending: true });
-    if (!report) return undefined;
-    const poll = await Poll.findOne({ slug: report.pollSlug });
-    if (!poll?.creatorId) {
-      return response.status(409).json({ message: "This legacy poll has no account owner" });
-    }
-    if (poll.creatorId === request.auth.user.id) {
-      return response.status(400).json({ message: "You cannot suspend your own account" });
-    }
+    const result = await withDatabaseTransaction(async (session) => {
+      const report = await findReport(request.params.id, { pending: true, session });
+      const poll = await withSession(Poll.findOne({ slug: report.pollSlug }), session);
+      if (!poll?.creatorId) {
+        throw new ModerationRequestError("This legacy poll has no account owner", 409);
+      }
+      if (poll.creatorId === request.auth.user.id) {
+        throw new ModerationRequestError("You cannot suspend your own account");
+      }
 
-    const reason = (note || `Poll moderation: ${report.reason}`).slice(0, 200);
-    await withDatabaseTransaction(async (session) => {
+      const reason = (note || `Poll moderation: ${report.reason}`).slice(0, 200);
       await suspendAuthUser(poll.creatorId, reason, { session });
-      await createAction({
-        ...actorFrom(request),
-        action: "owner_suspended",
-        reportId: report._id,
+      const affectedReports = await resolvePendingReports({
         pollSlug: report.pollSlug,
+        action: "owner_suspended",
+        actor: actorFrom(request),
         targetUserId: poll.creatorId,
         note: reason,
-      }, session);
+        before: pollSnapshot(poll),
+        after: pollSnapshot(poll),
+        session,
+      });
+      return { affectedReports };
     });
-    return response.json({ message: "Poll owner suspended" });
+    return response.json({ message: "Poll owner suspended and report resolved", affectedReports: result.affectedReports });
   } catch (error) {
     return sendAdminError(error, response, next);
   }

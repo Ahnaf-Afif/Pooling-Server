@@ -295,6 +295,19 @@ test("adds internal notes to a report audit history", async () => {
   assert.equal(seen.action.action, "note_added");
 });
 
+test("suspending a poll owner resolves the related report atomically", async () => {
+  const response = await fetch(`${baseUrl}/api/moderation/reports/${reportId}/suspend-owner`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ note: "Repeated abuse" }),
+  });
+  assert.equal(response.status, 200);
+  assert.equal(currentReport.status, "resolved");
+  assert.equal(seen.sessionsRevoked, true);
+  assert.equal(seen.action.action, "owner_suspended");
+  assert.equal((await response.json()).affectedReports, 1);
+});
+
 test("only administrators can list users and private photo data is omitted", async () => {
   const denied = await fetch(`${baseUrl}/api/moderation/users`, { headers: { "x-test-role": "moderator" } });
   assert.equal(denied.status, 403);
