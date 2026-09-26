@@ -6,6 +6,7 @@ import mongoose from "mongoose";
 
 import { closeDatabases } from "../src/db.js";
 import Poll from "../src/models/Poll.js";
+import PlatformStats from "../src/models/PlatformStats.js";
 import RateBucket from "../src/models/RateBucket.js";
 import VoteReceipt from "../src/models/VoteReceipt.js";
 import pollRoutes from "../src/routes/polls.js";
@@ -20,6 +21,11 @@ const originalPollMethods = {
   findOneAndUpdate: Poll.findOneAndUpdate,
 };
 const originalTransaction = mongoose.connection.transaction;
+const originalStats = {
+  findById: PlatformStats.findById,
+  findOneAndUpdate: PlatformStats.findOneAndUpdate,
+  updateOne: PlatformStats.updateOne,
+};
 const originalRateLimit = RateBucket.findOneAndUpdate;
 const originalVoteReceiptMethods = {
   create: VoteReceipt.create,
@@ -34,14 +40,19 @@ before(async () => {
     seen.filter = filter;
     return {
       sort(value) { seen.sort = value; return this; },
-      skip(value) { seen.skip = value; return this; },
+      maxTimeMS(value) { seen.maxTimeMS = value; return this; },
       limit(value) {
         seen.limit = value;
-        return Promise.resolve([{ slug: "one" }, { slug: "two" }, { slug: "three" }]);
+        return Promise.resolve(["one", "two", "three"].map((slug) => ({
+          slug, _id: new mongoose.Types.ObjectId(), createdAt: new Date(), lastVotedAt: null, totalVotes: 3,
+        })));
       },
     };
   };
-  Poll.aggregate = async () => [{ activePolls: 5, totalVotes: 23 }];
+  Poll.aggregate = () => ({ option: async () => [{ activePolls: 5, totalVotes: 23, trending: 2 }] });
+  PlatformStats.findById = () => ({ lean: async () => null });
+  PlatformStats.findOneAndUpdate = async () => ({ _id: "public" });
+  PlatformStats.updateOne = async () => ({ matchedCount: 1 });
   Poll.distinct = async () => ["Tech", "Social"];
   Poll.countDocuments = async () => 2;
   Poll.create = async (data) => {
@@ -75,6 +86,7 @@ before(async () => {
 after(async () => {
   await stopServer(server);
   Object.assign(Poll, originalPollMethods);
+  Object.assign(PlatformStats, originalStats);
   mongoose.connection.transaction = originalTransaction;
   RateBucket.findOneAndUpdate = originalRateLimit;
   Object.assign(VoteReceipt, originalVoteReceiptMethods);
@@ -82,19 +94,34 @@ after(async () => {
 });
 
 test("filters and paginates the poll feed", async () => {
-  const response = await fetch(`${baseUrl}/api/polls?category=Tech&trending=true&limit=2&page=2`);
+  const response = await fetch(`${baseUrl}/api/polls?category=Tech&trending=true&limit=2`);
   assert.equal(response.status, 200);
   const data = await response.json();
   assert.equal(seen.filter.category, "Tech");
   assert.deepEqual(seen.filter.totalVotes, { $gte: 3 });
   assert.ok(seen.filter.$or[0].lastVotedAt.$gte instanceof Date);
   assert.ok(seen.filter.$or[1].createdAt.$gte instanceof Date);
-  assert.deepEqual(seen.sort, { totalVotes: -1, lastVotedAt: -1, createdAt: -1 });
-  assert.equal(seen.skip, 2);
+  assert.deepEqual(seen.sort, { totalVotes: -1, lastVotedAt: -1, createdAt: -1, _id: -1 });
+  assert.equal(seen.maxTimeMS, 5000);
   assert.equal(seen.limit, 3);
   assert.equal(data.polls.length, 2);
   assert.equal(data.hasMore, true);
   assert.equal(data.stats.activePolls, 5);
+  assert.equal(data.stats.categories, 6);
+  assert.ok(data.nextCursor);
+  const next = await fetch(`${baseUrl}/api/polls?category=Tech&trending=true&limit=2&cursor=${data.nextCursor}`);
+  assert.equal(next.status, 200);
+  assert.equal((await next.json()).stats, undefined);
+  assert.equal(seen.filter.$and[0].category, "Tech");
+  assert.equal(seen.filter.$and[1].totalVotes.$lte, 3);
+  assert.ok(seen.filter.$and[2].$or.length);
+});
+
+test("rejects malformed and mismatched cursors rather than silently restarting", async () => {
+  const first = await (await fetch(`${baseUrl}/api/polls?category=Tech&limit=2&stats=false`)).json();
+  for (const query of ["cursor=bad-json", `category=Food&cursor=${first.nextCursor}`, "limit=101", "cursor=", "page=2"]) {
+    assert.equal((await fetch(`${baseUrl}/api/polls?${query}`)).status, 400);
+  }
 });
 
 test("loads a validated set of polls in one request", async () => {

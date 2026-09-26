@@ -67,5 +67,12 @@ pollSchema.index({ lastVotedAt: -1, totalVotes: -1 });
 pollSchema.index({ creatorId: 1, createdAt: -1 });
 pollSchema.index({ deletedAt: 1, status: 1, category: 1, createdAt: -1 });
 pollSchema.index({ deletedAt: 1, status: 1, totalVotes: -1, lastVotedAt: -1, createdAt: -1 });
+// Keep the immutable tie-breaker in every cursor index. Status is a residual
+// filter because $ne before the sort keys would prevent efficient ordering.
+pollSchema.index({ deletedAt: 1, createdAt: -1, _id: -1 });
+pollSchema.index({ deletedAt: 1, category: 1, createdAt: -1, _id: -1 });
+pollSchema.index({ creatorId: 1, deletedAt: 1, createdAt: -1, _id: -1 });
+pollSchema.index({ deletedAt: 1, totalVotes: -1, lastVotedAt: -1, createdAt: -1, _id: -1 });
+pollSchema.index({ deletedAt: 1, category: 1, totalVotes: -1, lastVotedAt: -1, createdAt: -1, _id: -1 });
 
 export default mongoose.model("Poll", pollSchema);

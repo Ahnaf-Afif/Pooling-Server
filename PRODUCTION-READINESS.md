@@ -17,7 +17,7 @@ No production test may create dummy public posts or change real user data.
 | Semantic vote integrity and edit history | Server locks labels/question after votes; UI now disables these fields, snapshots/notices exist. Full history, browser/concurrency coverage and deployed checks remain. |
 | Runtime, test timeouts, CI and dependency maintenance | Official checksum-verified Node 22.23.3: 46 unit tests and 16 isolated integration tests pass. Syntax checking covers all JS files. Both frontend build engines passed at the frontend checkpoint. CI deployment gating and automated dependency updates remain. |
 | Abuse protection | IP write limits exist. Need account-aware/read controls and bot mitigation; anonymous voting cannot prove one human/one vote. |
-| Feed performance | Still performs aggregate/distinct/count per page and uses offsets. Implement cursors, reusable statistics and correct active count. |
+| Feed performance | Public/owner cursor pagination, matching ordered indexes, shared 60-second statistics cache/refresh lease, constant categories and corrected active count implemented. Node 22 replica-set tests cover ties, new inserts, legacy activity dates and query plans on 1,000 local test polls. Broader load/capacity tests, trending scan analysis, redundant-index cleanup and deployed verification remain. |
 | Connection pooling and geography | Shared pool exists. Measure placement; Atlas region/settings need verification. |
 | Data visibility | Owner/report pagination exists; deep page caps and truncated histories still hide older data. |
 | Moderation workflow | Need assignment, priority, escalation, notifications/outcomes, appeals, and durable audit strategy. |
@@ -25,7 +25,7 @@ No production test may create dummy public posts or change real user data.
 | Retention and policy | Need executable retention, precise periods, terms acceptance, operator/age/jurisdiction details from owner. |
 | Browser security and search | Headers, self-hosted fonts, robots and sitemap exist; verify deployed behavior and CSP coverage. |
 | Rendering and live results | Initial poll/results server rendering and visible-tab result refresh implemented locally; production compilation passes. Poll-rendering/live-refresh browser coverage and deployed verification remain. |
-| Frontend quality | Four Chromium tests pass against both production build engines: sign-in outage/retry, staff enrollment/access, scoped security accessibility, signed-out account gate. Need whole-site accessibility, performance, real frontend/backend flow and cross-browser coverage. |
+| Frontend quality | Seven Chromium tests pass on the standalone Turbopack production bundle: prior security coverage plus feed cursor/category handling, statistics outages and owner load-more retry/deduplication. Need whole-site accessibility, performance, real frontend/backend flow and cross-browser coverage. |
 | Release/source consistency | Local commits ahead of remotes. Verify/push tested commits and prevent production drift. |
 | Operations | Need staging/isolated integration, release/rollback/incident/restore runbooks, metrics and alert verification. |
 | External controls | Atlas backup/restore, access list, alerts/region; Vercel WAF/spend/protection; OAuth publishing/quotas; monitored support and recovery access remain unverified. |
@@ -33,13 +33,15 @@ No production test may create dummy public posts or change real user data.
 Owner input requested: public operator name, country/jurisdiction, support mailbox,
 minimum age and recovery administrator email. No credentials requested in chat.
 
-## Latest verification (September 26, 2026)
+## Latest verification (September 27, 2026)
 
 - Previous goal turn: progress via local checkpoints 727fe2b (backend) and ae24192 (frontend), with real Node 22 unit/integration and Chromium evidence.
 - Current changes remain local; no production deployment is claimed.
 - Restricted listeners initially returned EPERM. Approved execution restored real HTTP test coverage; the previous approval-review availability issue is no longer blocking these backend checks.
-- Node 22 unit suite: 46/46 passing. Local MongoDB 7.0 replica-set suite: 16/16 passing, including auth, transactions, account deletion, index drift/repair, stable voter-key behavior and guarded ciphertext rotation. No Atlas data used.
-- Frontend lint passes; webpack and default Turbopack production builds pass on Node 22 in a temporary copy excluding environment files. Four mocked-API Chromium tests pass against each build. This is not a live OAuth/Atlas deployment test. The browser runner currently uses `next start`, which warns when standalone output is enabled; switch to the standalone launcher before claiming standalone packaging coverage.
+- Node 22.23.3 unit suite: 47/47 passing. Local MongoDB 7.0 replica-set suite: 20/20 passing, including auth, transactions, account deletion, index drift/repair, stable voter-key behavior, ciphertext rotation and cursor/statistics/query-plan regressions. No Atlas data used.
+- Frontend lint and default Turbopack production build pass on Node 22 in a temporary copy excluding environment files. Seven mocked-API Chromium tests pass against the actual standalone launcher including static assets. This is not a live OAuth/Atlas deployment test; the previous webpack build evidence predates the latest pagination changes.
+- A query-plan regression initially examined 139 documents for 11 later-page results. A leading-key cursor bound now keeps the tested public/category/owner queries under 40 examined documents and avoids blocking sorts. This is bounded local evidence, not a production load benchmark.
+- Cursor API changes require a coordinated frontend/backend promotion and migration 2026-09-poll-cursors-v4. Numbered moderation lists, truncated history, sitemap's 10,000-poll ceiling and homepage's first-page-only ownership badges remain open.
 
 Deployment prerequisite for this backend checkpoint: set VOTER_SECRET to the
 historical auth key used to generate existing receipts before deploying. Do not

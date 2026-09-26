@@ -5,6 +5,7 @@ import { makeSignature, symmetricDecrypt, symmetricEncrypt } from "better-auth/c
 import { createOTP } from "@better-auth/utils/otp";
 import { MongoMemoryReplSet } from "mongodb-memory-server";
 import { rotateAuthEncryption } from "../src/services/auth-encryption.js";
+import { getPlatformStats } from "../src/services/platform-stats.js";
 
 // Always create an isolated local replica set. Never read .env or reuse Atlas.
 let replicaSet, server, baseUrl, database, auth, closeDatabases, withDatabaseTransaction;
@@ -375,4 +376,110 @@ test("rotation never overwrites a concurrently refreshed OAuth token", async () 
   await assert.rejects(() => rotateAuthEncryption(concurrentDatabase, current, { apply: true }), /Concurrent auth updates/);
   assert.equal((await collection.findOne({})).accessToken, refreshed);
   await rotateAuthEncryption(database, current, { verify: true });
+});
+
+test("poll cursors handle equal timestamps and new insertions without offsets or duplicate rows", async () => {
+  const owner = await createUser();
+  const other = await createUser();
+  const originals = [];
+  for (let index = 0; index < 5; index += 1) originals.push(await createPoll(owner.id));
+  await database.collection("polls").updateMany({}, { $set: { createdAt: new Date("2026-01-01T00:00:00Z") } });
+  const first = await (await fetch(`${baseUrl}/api/polls?limit=2&stats=false`)).json();
+  assert.equal(first.polls.length, 2);
+  await createPoll(other.id);
+  const slugs = first.polls.map((poll) => poll.id);
+  let cursor = first.nextCursor;
+  while (cursor) {
+    const response = await fetch(`${baseUrl}/api/polls?limit=2&cursor=${cursor}`);
+    assert.equal(response.status, 200);
+    const page = await response.json();
+    assert.equal(page.stats, undefined);
+    slugs.push(...page.polls.map((poll) => poll.id));
+    cursor = page.nextCursor;
+  }
+  assert.equal(new Set(slugs).size, originals.length);
+  assert.deepEqual([...slugs].sort(), originals.map((poll) => poll.slug).sort());
+
+  const mine = await (await fetch(`${baseUrl}/api/polls/mine?limit=2`, { headers: { Cookie: owner.cookie } })).json();
+  const wrongOwner = await fetch(`${baseUrl}/api/polls/mine?cursor=${mine.nextCursor}`, { headers: { Cookie: other.cookie } });
+  assert.equal(wrongOwner.status, 400);
+  const nextMine = await fetch(`${baseUrl}/api/polls/mine?limit=2&cursor=${mine.nextCursor}`, { headers: { Cookie: owner.cookie } });
+  assert.equal(nextMine.headers.get("cache-control"), "private, no-store");
+  assert.equal((await nextMine.json()).polls.length, 2);
+});
+
+test("trending cursors preserve popularity ordering and include legacy null activity dates", async () => {
+  const entries = [];
+  for (let index = 0; index < 5; index += 1) entries.push(await createPoll());
+  await database.collection("polls").updateMany({}, { $set: { totalVotes: 5, createdAt: new Date(), lastVotedAt: null } });
+  await database.collection("polls").updateOne({ _id: entries[0]._id }, { $set: { totalVotes: 10, lastVotedAt: new Date() } });
+  await database.collection("polls").updateOne({ _id: entries[1]._id }, { $set: { lastVotedAt: new Date() } });
+  let cursor;
+  const slugs = [];
+  do {
+    const response = await fetch(`${baseUrl}/api/polls?trending=true&limit=1&stats=false${cursor ? `&cursor=${cursor}` : ""}`);
+    assert.equal(response.status, 200);
+    const page = await response.json();
+    slugs.push(...page.polls.map((poll) => poll.id));
+    cursor = page.nextCursor;
+    assert.ok(slugs.length <= entries.length, "cursor must advance");
+  } while (cursor);
+  assert.equal(slugs[0], entries[0].slug);
+  assert.equal(slugs[1], entries[1].slug);
+  assert.equal(new Set(slugs).size, entries.length);
+});
+
+test("shared statistics exclude closed polls from active count and reuse one refresh", async () => {
+  const active = await createPoll();
+  const closed = await createPoll();
+  const archived = await createPoll();
+  const removed = await createPoll();
+  await database.collection("polls").updateOne({ _id: active._id }, { $set: { totalVotes: 4, lastVotedAt: new Date() } });
+  await database.collection("polls").updateOne({ _id: closed._id }, { $set: { status: "closed", totalVotes: 2 } });
+  await database.collection("polls").updateOne({ _id: archived._id }, { $set: { status: "archived", totalVotes: 100 } });
+  await database.collection("polls").updateOne({ _id: removed._id }, { $set: { deletedAt: new Date(), totalVotes: 100 } });
+  const aggregate = Poll.aggregate;
+  let scans = 0;
+  Poll.aggregate = (...args) => { scans += 1; return aggregate.apply(Poll, args); };
+  try {
+    const values = await Promise.all(Array.from({ length: 8 }, () => getPlatformStats("stats-test")));
+    assert.equal(scans, 1);
+    assert.ok(values.every((value) => value.activePolls === 1 && value.totalVotes === 6 && value.categories === 6 && value.trending === 1));
+    await getPlatformStats("cached-stats-test");
+    assert.equal(scans, 1);
+
+    // Simulate another serverless instance holding the refresh lease.
+    await database.collection("platformstats").updateOne({ _id: "public" }, { $set: { expiresAt: new Date(0), refreshUntil: new Date(Date.now() + 15_000), refreshToken: "other-instance" } });
+    assert.equal((await getPlatformStats("leased-stats-test")).stale, true);
+    assert.equal(scans, 1);
+  } finally { Poll.aggregate = aggregate; }
+});
+
+test("newest feed cursors use ordered indexes rather than scanning previous pages", async () => {
+  const { paginatePolls } = await import("../src/services/poll-pagination.js");
+  const now = Date.now();
+  await Poll.insertMany(Array.from({ length: 1000 }, (_, index) => ({
+    slug: `index-test-${index}`, question: "Local index test only?", category: index % 2 ? "Tech" : "Food",
+    creatorId: "index-test-owner", options: [{ label: "One" }, { label: "Two" }],
+    createdAt: new Date(now - index * 1000), status: index % 5 ? "active" : "archived",
+  })));
+  for (const filter of [
+    { deletedAt: null, status: { $ne: "archived" } },
+    { deletedAt: null, status: { $ne: "archived" }, category: "Tech" },
+    { deletedAt: null, creatorId: "index-test-owner" },
+  ]) {
+    const first = await paginatePolls({ query: { limit: "100" }, filter, scope: "index-test" });
+    const originalFind = Poll.find;
+    let query;
+    Poll.find = function (...args) { query = originalFind.apply(this, args); return query; };
+    try {
+      await paginatePolls({ query: { limit: "10", cursor: first.nextCursor }, filter, scope: "index-test" });
+    } finally { Poll.find = originalFind; }
+    const explanation = await query.clone().explain("executionStats");
+    const plan = JSON.stringify(explanation.queryPlanner.winningPlan);
+    assert.match(plan, /IXSCAN/, "feed should use an index");
+    assert.doesNotMatch(plan, /"stage":"SORT"/, "feed should not require a blocking sort");
+    assert.equal(explanation.executionStats.nReturned, 11);
+    assert.ok(explanation.executionStats.totalDocsExamined <= 40, `examined ${explanation.executionStats.totalDocsExamined} records for 11 results`);
+  }
 });

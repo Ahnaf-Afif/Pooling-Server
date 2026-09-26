@@ -37,7 +37,7 @@ Set all server variables from `.env.example` in the Vercel project's **Productio
 - `GET /api/health` — readiness check
 - `/api/auth/*` — Better Auth sign-in/session endpoints; built-in administration and alternative session-management routes are disabled
 - `GET /api/auth-config` — enabled public sign-in methods (never returns credentials)
-- `GET /api/polls?category=Tech&trending=true&page=1&limit=12` — filtered, paginated polls, `hasMore`, and platform statistics
+- `GET /api/polls?category=Tech&trending=true&limit=12` — filtered polls, `hasMore`, `nextCursor`, and cached platform statistics
 - `GET /api/polls/:slug` — one poll
 - `POST /api/polls` — create a poll (verified account required)
 - `GET /api/polls/mine` — polls owned by the current account
@@ -60,6 +60,33 @@ Set all server variables from `.env.example` in the Vercel project's **Productio
 - `POST /api/moderation/users/:id/reactivate` — restore a suspended account
 
 Report decisions, content edits, role changes, suspensions, and reactivations are recorded in an internal audit history. Administrators cannot suspend themselves or change their own role through the dashboard, which prevents accidental lockout.
+
+### Poll pagination and statistics
+
+Public and owned poll lists use opaque `nextCursor` values. Pass the returned
+cursor as `cursor` with the same filters to load the next page; a null cursor
+means the end. Public limits are 1–100 (default 50); owner limits are 1–50
+(default 24). Changed filters or accounts require restarting without a cursor.
+Numbered pages after page one are rejected. Moderation lists still use numbered
+pages and their existing caps; these require separate migration.
+
+Public statistics are global, not category-specific. They refresh at most once
+per minute through a shared database lease, and only accompany the first page
+unless `stats=false` is supplied. `stats: null` means temporarily unavailable;
+`stats.stale: true` identifies a previously cached value during a refresh or
+outage. Categories come from the fixed category list; active count excludes
+closed and archived polls. Later pages omit statistics.
+
+Newest-first cursors use creation time and an immutable ID tie-breaker. Trending
+uses live vote/activity ordering, not a frozen snapshot: changed ranks can move
+a poll before a previous cursor, so refresh to see the current ordering.
+
+**Release compatibility:** deploy the matching frontend and backend together
+behind a verified release process. An older frontend's `page=2` requests will
+fail against this API; an older backend does not provide the new cursors. Apply
+and verify migration `2026-09-poll-cursors-v4` before promotion, and preserve the
+VOTER_SECRET prerequisite documented in SECRET-ROTATION.md. No production
+migration or deployment is implied by the local tests.
 
 Writes use MongoDB-backed rate limits across Vercel instances. Poll creation is limited per account and IP. Anonymous voting uses a signed HttpOnly first-party cookie and a unique database receipt; it prevents repeat votes from the same browser but remains a casual-poll model because cookies, devices, and networks can be changed.
 

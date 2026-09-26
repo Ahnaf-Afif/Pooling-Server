@@ -10,11 +10,12 @@ import VoteReceipt from "../models/VoteReceipt.js";
 import { limitPollCreation, limitReports, limitWrites } from "../rate-limit.js";
 import { createSlug, validatePoll } from "../validation.js";
 import { getVoterKey } from "../voter.js";
+import { paginatePolls, PaginationError } from "../services/poll-pagination.js";
+import { getPlatformStats } from "../services/platform-stats.js";
 
 const router = Router();
 const notDeleted = { deletedAt: null };
 const activeStatus = { $in: ["active", null] };
-const MAX_PAGE = 1000;
 
 class VoteRejectedError extends Error {
   constructor(message, status) {
@@ -57,60 +58,36 @@ router.get("/", async (request, response, next) => {
       filter.slug = { $in: ids };
     }
 
-    const requestedLimit = request.query.limit === undefined ? 50 : Number(request.query.limit);
-    const limit = Number.isSafeInteger(requestedLimit) ? Math.min(Math.max(requestedLimit, 1), 100) : 50;
-    const page = request.query.page === undefined ? 1 : Number(request.query.page);
-    if (!Number.isSafeInteger(page) || page < 1 || page > MAX_PAGE) {
-      return response.status(400).json({ message: `Page must be between 1 and ${MAX_PAGE}` });
-    }
-    const sort = request.query.trending === "true"
-      ? { totalVotes: -1, lastVotedAt: -1, createdAt: -1 }
-      : { createdAt: -1, _id: -1 };
-    const [polls, totals, categories, trending] = await Promise.all([
-      Poll.find(filter).sort(sort).skip((page - 1) * limit).limit(limit + 1),
-      Poll.aggregate([
-        { $match: { ...notDeleted, status: { $ne: "archived" } } },
-        { $group: { _id: null, activePolls: { $sum: 1 }, totalVotes: { $sum: "$totalVotes" } } },
-      ]),
-      Poll.distinct("category", { ...notDeleted, status: { $ne: "archived" } }),
-      Poll.countDocuments(trendingFilter),
-    ]);
+    const trending = request.query.trending === "true";
+    const scope = JSON.stringify(["public", filter.category || "", trending, filter.slug?.$in?.slice().sort() || []]);
+    const result = await paginatePolls({ query: request.query, filter, scope, trending });
+    const includeStats = request.query.cursor === undefined && request.query.stats !== "false";
+    const stats = includeStats ? await getPlatformStats(request.id) : undefined;
 
     response.set("Cache-Control", "public, max-age=10, stale-while-revalidate=30");
-    return response.json({
-      polls: polls.slice(0, limit),
-      hasMore: polls.length > limit,
-      stats: {
-        activePolls: totals[0]?.activePolls || 0,
-        totalVotes: totals[0]?.totalVotes || 0,
-        categories: categories.length,
-        trending,
-      },
-    });
+    return response.json({ ...result, ...(includeStats ? { stats } : {}) });
   } catch (error) {
+    if (error instanceof PaginationError) return response.status(400).json({ message: error.message });
     return next(error);
   }
 });
 
 router.get("/mine", requireVerifiedUser, async (request, response, next) => {
+  response.set("Cache-Control", "private, no-store");
   try {
-    const requestedLimit = request.query.limit === undefined ? 24 : Number(request.query.limit);
-    const limit = Number.isSafeInteger(requestedLimit) ? Math.min(Math.max(requestedLimit, 1), 50) : 24;
-    const page = request.query.page === undefined ? 1 : Number(request.query.page);
-    if (!Number.isSafeInteger(page) || page < 1 || page > MAX_PAGE) {
-      return response.status(400).json({ message: `Page must be between 1 and ${MAX_PAGE}` });
-    }
-    const polls = await Poll.find({ creatorId: request.auth.user.id, ...notDeleted })
-      .sort({ createdAt: -1 })
-      .skip((page - 1) * limit)
-      .limit(limit + 1);
-    return response.json({ polls: polls.slice(0, limit), page, hasMore: polls.length > limit });
+    const result = await paginatePolls({
+      query: request.query, filter: { creatorId: request.auth.user.id, ...notDeleted },
+      scope: `mine:${request.auth.user.id}`, defaultLimit: 24, maxLimit: 50,
+    });
+    return response.json(result);
   } catch (error) {
+    if (error instanceof PaginationError) return response.status(400).json({ message: error.message });
     return next(error);
   }
 });
 
 router.get("/mine/:slug", requireVerifiedUser, async (request, response, next) => {
+  response.set("Cache-Control", "private, no-store");
   try {
     const poll = await Poll.findOne(ownerFilter(request));
     if (!poll) return response.status(404).json({ message: "Poll not found" });

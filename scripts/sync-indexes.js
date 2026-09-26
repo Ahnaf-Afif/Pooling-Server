@@ -7,9 +7,10 @@ import RateBucket from "../src/models/RateBucket.js";
 import Report from "../src/models/Report.js";
 import VoteReceipt from "../src/models/VoteReceipt.js";
 import AdminGuard from "../src/models/AdminGuard.js";
+import PlatformStats from "../src/models/PlatformStats.js";
 
-const models = [Poll, VoteReceipt, Report, ModerationAction, RateBucket, AdminGuard];
-const migrationId = "2026-09-voter-lookup-v3";
+const models = [Poll, VoteReceipt, Report, ModerationAction, RateBucket, AdminGuard, PlatformStats];
+const migrationId = "2026-09-poll-cursors-v4";
 
 const nativeIndexes = {
   user: [
