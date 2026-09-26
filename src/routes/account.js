@@ -31,11 +31,12 @@ router.get("/export", async (request, response, next) => {
   try {
     const userId = request.auth.user.id;
     const voterKey = getAccountVoterKey(userId);
-    const [user, polls, votes, reports] = await Promise.all([
+    const [user, polls, votes, reports, moderationActions] = await Promise.all([
       AuthUser.findOne(accountFilter(userId)).select("name email emailVerified role createdAt").lean(),
       Poll.find({ creatorId: userId }).select("slug question category options totalVotes status createdAt updatedAt moderatedAt").sort({ createdAt: 1 }).lean(),
       VoteReceipt.find({ voterKey }).select("pollSlug optionId createdAt").sort({ createdAt: 1 }).lean(),
       Report.find({ reporterUserId: userId }).select("pollSlug reason details status createdAt reviewedAt").sort({ createdAt: 1 }).lean(),
+      ModerationAction.find({ actorId: userId }).select("action pollSlug reportId targetUserId note changedFields createdAt").sort({ createdAt: 1 }).lean(),
     ]);
     response.set("Cache-Control", "no-store");
     return response.json({
@@ -51,6 +52,7 @@ router.get("/export", async (request, response, next) => {
       polls,
       votes,
       reports,
+      moderationActions,
     });
   } catch (error) {
     return next(error);
@@ -86,9 +88,10 @@ router.post("/delete", limitWrites, async (request, response, next) => {
         { $set: { reporterUserId: null } },
         { session },
       );
+      const anonymizedActorId = `deleted:${randomUUID()}`;
       await ModerationAction.updateMany(
-        { targetUserId: userId },
-        { $set: { targetUserId: null } },
+        { $or: [{ targetUserId: userId }, { actorId: userId }] },
+        { $set: { targetUserId: null, actorId: anonymizedActorId, actorName: "Deleted user" } },
         { session },
       );
 
