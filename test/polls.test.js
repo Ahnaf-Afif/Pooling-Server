@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { after, before, test } from "node:test";
 import express from "express";
+import mongoose from "mongoose";
 
 import { closeDatabases } from "../src/db.js";
 import Poll from "../src/models/Poll.js";
@@ -14,8 +15,10 @@ const originalPollMethods = {
   distinct: Poll.distinct,
   countDocuments: Poll.countDocuments,
   create: Poll.create,
+  exists: Poll.exists,
   findOneAndUpdate: Poll.findOneAndUpdate,
 };
+const originalTransaction = mongoose.connection.transaction;
 const originalRateLimit = RateBucket.findOneAndUpdate;
 const originalVoteReceiptMethods = {
   create: VoteReceipt.create,
@@ -50,7 +53,8 @@ before(async () => {
     return { slug: filter.slug };
   };
   RateBucket.findOneAndUpdate = async () => ({ count: 1 });
-  VoteReceipt.create = async (data) => ({ _id: "receipt-id", ...data });
+  mongoose.connection.transaction = async (work) => work({ testSession: true });
+  VoteReceipt.create = async (data) => [{ _id: "receipt-id", ...data[0] }];
   VoteReceipt.deleteOne = async () => ({ deletedCount: 1 });
 
   const app = express();
@@ -63,8 +67,13 @@ before(async () => {
     next();
   });
   app.use("/api/polls", pollRoutes);
-  server = app.listen(0, "127.0.0.1");
-  await new Promise((resolve) => server.once("listening", resolve));
+  let listener;
+  await new Promise((resolve, reject) => {
+    listener = app.listen(0, "127.0.0.1");
+    listener.once("listening", resolve);
+    listener.once("error", reject);
+  });
+  server = listener;
   baseUrl = `http://127.0.0.1:${server.address().port}`;
 });
 
@@ -74,6 +83,7 @@ after(async () => {
     server.closeAllConnections();
   });
   Object.assign(Poll, originalPollMethods);
+  mongoose.connection.transaction = originalTransaction;
   RateBucket.findOneAndUpdate = originalRateLimit;
   Object.assign(VoteReceipt, originalVoteReceiptMethods);
   await closeDatabases();

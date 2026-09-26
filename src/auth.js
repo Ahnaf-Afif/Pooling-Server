@@ -1,7 +1,7 @@
 import { mongodbAdapter } from "@better-auth/mongo-adapter";
 import { betterAuth } from "better-auth";
 import { admin, magicLink } from "better-auth/plugins";
-import { adminAc, defaultAc, userAc } from "better-auth/plugins/admin/access";
+import { defaultAc, userAc } from "better-auth/plugins/admin/access";
 
 import { getClientOrigins } from "./config.js";
 import { getMongoClient, getMongoDatabase } from "./db.js";
@@ -27,6 +27,44 @@ const magicLinkConfigured = Boolean(
   process.env.RESEND_API_KEY?.trim() && process.env.AUTH_EMAIL_FROM?.trim(),
 );
 const moderatorAc = defaultAc.newRole({ user: [], session: [] });
+const adminAc = defaultAc.newRole({
+  user: ["list", "get", "set-role", "ban"],
+  session: [],
+});
+const disabledAdminPaths = [
+  "/admin/create-user",
+  "/admin/list-users",
+  "/admin/get-user",
+  "/admin/set-role",
+  "/admin/set-user-password",
+  "/admin/update-user",
+  "/admin/ban-user",
+  "/admin/unban-user",
+  "/admin/list-user-sessions",
+  "/admin/revoke-user-session",
+  "/admin/revoke-user-sessions",
+  "/admin/impersonate-user",
+  "/admin/stop-impersonating",
+  "/admin/remove-user",
+  "/admin/has-permission",
+];
+
+function getVersionedSecrets() {
+  const configured = process.env.BETTER_AUTH_SECRETS?.trim();
+  if (!configured) return [{ version: 1, value: authSecret || "development-only-secret-change-before-production-1234" }];
+
+  let secrets;
+  try {
+    secrets = JSON.parse(configured);
+  } catch {
+    throw new Error("BETTER_AUTH_SECRETS must be a JSON array of versioned secrets");
+  }
+  if (!Array.isArray(secrets) || !secrets.length || secrets.some(({ version, value } = {}) =>
+    !Number.isSafeInteger(version) || version < 1 || typeof value !== "string" || value.length < 32)) {
+    throw new Error("BETTER_AUTH_SECRETS contains an invalid version or secret");
+  }
+  return secrets;
+}
 
 async function sendMagicLink({ email, url }) {
   if (!magicLinkConfigured) {
@@ -84,9 +122,14 @@ export const auth = betterAuth({
   appName: "What Do You Think?",
   baseURL: authBaseUrl || "http://localhost:3000",
   secret: authSecret || "development-only-secret-change-before-production-1234",
+  secrets: getVersionedSecrets(),
   database: mongodbAdapter(getMongoDatabase(), { client: getMongoClient() }),
   trustedOrigins: getClientOrigins(),
+  disabledPaths: disabledAdminPaths,
   socialProviders,
+  account: {
+    encryptOAuthTokens: true,
+  },
   session: {
     expiresIn: 60 * 60 * 24 * 30,
     updateAge: 60 * 60 * 24,

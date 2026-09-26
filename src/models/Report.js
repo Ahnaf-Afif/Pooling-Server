@@ -23,7 +23,14 @@ const reportSchema = new mongoose.Schema(
   { timestamps: true, versionKey: false },
 );
 
-reportSchema.index({ pollSlug: 1, reporterKey: 1 }, { unique: true });
+reportSchema.index(
+  { pollSlug: 1, reporterKey: 1 },
+  {
+    name: "unique_pending_reporter_per_poll",
+    unique: true,
+    partialFilterExpression: { status: "pending" },
+  },
+);
 reportSchema.index({ status: 1, createdAt: -1 });
 
 export default mongoose.model("Report", reportSchema);

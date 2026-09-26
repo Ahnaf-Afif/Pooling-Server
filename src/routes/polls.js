@@ -3,6 +3,7 @@ import mongoose from "mongoose";
 
 import { readOptionalSession, requireVerifiedUser } from "../auth-middleware.js";
 import { CATEGORIES, TRENDING_MIN_VOTES, TRENDING_WINDOW_MS } from "../constants.js";
+import { withDatabaseTransaction } from "../db.js";
 import Poll from "../models/Poll.js";
 import Report from "../models/Report.js";
 import VoteReceipt from "../models/VoteReceipt.js";
@@ -13,6 +14,14 @@ import { getVoterKey } from "../voter.js";
 const router = Router();
 const notDeleted = { deletedAt: null };
 const activeStatus = { $in: ["active", null] };
+
+class VoteRejectedError extends Error {
+  constructor(message, status) {
+    super(message);
+    this.name = "VoteRejectedError";
+    this.status = status;
+  }
+}
 
 function ownerFilter(request) {
   return {
@@ -234,7 +243,6 @@ router.post("/:slug/reports", limitReports, async (request, response, next) => {
 });
 
 router.post("/:slug/votes", limitWrites, async (request, response, next) => {
-  let receipt;
   try {
     const optionId = request.body?.optionId;
     if (typeof optionId !== "string" || !mongoose.isValidObjectId(optionId)) {
@@ -243,35 +251,42 @@ router.post("/:slug/votes", limitWrites, async (request, response, next) => {
 
     const session = await readOptionalSession(request);
     const voterKey = getVoterKey(request, response, session);
-    receipt = await VoteReceipt.create({
-      pollSlug: request.params.slug,
-      voterKey,
-      optionId,
-    });
+    const poll = await withDatabaseTransaction(async (databaseSession) => {
+      await VoteReceipt.create([{
+        pollSlug: request.params.slug,
+        voterKey,
+        optionId,
+      }], { session: databaseSession });
 
-    const poll = await Poll.findOneAndUpdate(
-      {
-        slug: request.params.slug,
-        "options._id": optionId,
-        ...notDeleted,
-        status: activeStatus,
-      },
-      { $inc: { "options.$.votes": 1, totalVotes: 1 }, $set: { lastVotedAt: new Date() } },
-      { returnDocument: "after", runValidators: true },
-    );
-    if (!poll) {
-      await VoteReceipt.deleteOne({ _id: receipt._id });
-      const existing = await Poll.exists({ slug: request.params.slug, ...notDeleted });
-      return response.status(existing ? 409 : 404).json({
-        message: existing ? "This poll is closed or the option no longer exists" : "Poll not found",
-      });
-    }
+      const updatedPoll = await Poll.findOneAndUpdate(
+        {
+          slug: request.params.slug,
+          "options._id": optionId,
+          ...notDeleted,
+          status: activeStatus,
+        },
+        { $inc: { "options.$.votes": 1, totalVotes: 1 }, $set: { lastVotedAt: new Date() } },
+        { returnDocument: "after", runValidators: true, session: databaseSession },
+      );
+      if (updatedPoll) return updatedPoll;
+
+      const existingQuery = Poll.exists({ slug: request.params.slug, ...notDeleted });
+      const existing = typeof existingQuery.session === "function"
+        ? await existingQuery.session(databaseSession)
+        : await existingQuery;
+      throw new VoteRejectedError(
+        existing ? "This poll is closed or the option no longer exists" : "Poll not found",
+        existing ? 409 : 404,
+      );
+    });
     return response.json({ poll });
   } catch (error) {
     if (error?.code === 11000) {
       return response.status(409).json({ message: "You have already voted in this poll" });
     }
-    if (receipt?._id) await VoteReceipt.deleteOne({ _id: receipt._id }).catch(() => {});
+    if (error instanceof VoteRejectedError) {
+      return response.status(error.status).json({ message: error.message });
+    }
     return next(error);
   }
 });

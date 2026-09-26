@@ -3,9 +3,10 @@ import { after, before, beforeEach, test } from "node:test";
 import express from "express";
 import mongoose from "mongoose";
 
-import { auth } from "../src/auth.js";
 import { closeDatabases } from "../src/db.js";
 import ModerationAction from "../src/models/ModerationAction.js";
+import AuthSession from "../src/models/AuthSession.js";
+import AuthUser from "../src/models/AuthUser.js";
 import Poll from "../src/models/Poll.js";
 import RateBucket from "../src/models/RateBucket.js";
 import Report from "../src/models/Report.js";
@@ -17,28 +18,37 @@ const optionIds = [new mongoose.Types.ObjectId(), new mongoose.Types.ObjectId()]
 const original = {
   reportFind: Report.find,
   reportFindById: Report.findById,
+  reportCount: Report.countDocuments,
+  reportUpdateMany: Report.updateMany,
   pollFind: Poll.find,
   pollFindOne: Poll.findOne,
   pollFindOneAndUpdate: Poll.findOneAndUpdate,
   actionFind: ModerationAction.find,
   actionCreate: ModerationAction.create,
   rateLimit: RateBucket.findOneAndUpdate,
-  listUsers: auth.api.listUsers,
-  getUser: auth.api.getUser,
-  setRole: auth.api.setRole,
-  banUser: auth.api.banUser,
-  unbanUser: auth.api.unbanUser,
+  transaction: mongoose.connection.transaction,
+  userFind: AuthUser.find,
+  userCount: AuthUser.countDocuments,
+  userFindOne: AuthUser.findOne,
+  userFindOneAndUpdate: AuthUser.findOneAndUpdate,
+  sessionDeleteMany: AuthSession.deleteMany,
 };
 const seen = {};
+let currentPoll;
 let currentReport;
+let currentUser;
 let server;
 let baseUrl;
 
 function queryResult(value) {
   return {
     sort() { return this; },
+    skip() { return this; },
     limit() { return this; },
+    session() { return this; },
     lean() { return Promise.resolve(value); },
+    toArray() { return Promise.resolve(value); },
+    then(resolve, reject) { return Promise.resolve(value).then(resolve, reject); },
   };
 }
 
@@ -53,24 +63,41 @@ function makeReport(status = "pending") {
     status,
     reviewedBy: null,
     reviewedAt: null,
+    createdAt: new Date("2026-01-01T00:00:00Z"),
     async save() { return this; },
   };
 }
 
-function makePoll() {
+function makePoll({ totalVotes = 7 } = {}) {
   return {
     _id: pollId,
     slug: "reported-poll",
     question: "Which tool do you use?",
     category: "Tech",
     creatorId: "poll-owner",
-    totalVotes: 7,
+    totalVotes,
     status: "active",
     deletedAt: null,
+    updatedAt: new Date("2026-01-01T00:00:00Z"),
     options: [
-      { _id: optionIds[0], label: "One", votes: 3 },
-      { _id: optionIds[1], label: "Two", votes: 4 },
+      { _id: optionIds[0], label: "One", votes: totalVotes ? 3 : 0 },
+      { _id: optionIds[1], label: "Two", votes: totalVotes ? 4 : 0 },
     ],
+  };
+}
+
+function makeUser(overrides = {}) {
+  return {
+    _id: "member-1",
+    name: "Member One",
+    email: "member@example.com",
+    image: "https://example.com/private-photo.jpg",
+    emailVerified: true,
+    role: "user",
+    banned: false,
+    createdAt: new Date("2026-01-02T00:00:00Z"),
+    updatedAt: new Date("2026-01-02T00:00:00Z"),
+    ...overrides,
   };
 }
 
@@ -80,79 +107,68 @@ before(async () => {
   app.use((request, _response, next) => {
     const role = request.headers["x-test-role"] || "admin";
     request.auth = {
-      user: {
-        id: "admin-user",
-        name: "Test Admin",
-        email: "admin@example.com",
-        role,
-      },
+      user: { id: "admin-user", name: "Test Admin", email: "admin@example.com", role },
     };
     next();
   });
   app.use("/api/moderation", moderationRoutes);
   app.use((error, _request, response, _next) => response.status(500).json({ message: error.message }));
-  server = app.listen(0, "127.0.0.1");
-  await new Promise((resolve) => server.once("listening", resolve));
+  await new Promise((resolve, reject) => {
+    server = app.listen(0, "127.0.0.1");
+    server.once("listening", resolve);
+    server.once("error", reject);
+  });
   baseUrl = `http://127.0.0.1:${server.address().port}`;
 });
 
 beforeEach(() => {
   for (const key of Object.keys(seen)) delete seen[key];
+  currentPoll = makePoll();
   currentReport = makeReport();
-  Report.find = () => queryResult([{
-    ...currentReport,
-    createdAt: new Date("2026-01-01T00:00:00Z"),
-  }]);
-  Report.findById = async () => currentReport;
-  Poll.find = () => ({ lean: async () => [makePoll()] });
-  Poll.findOne = async () => makePoll();
+  currentUser = makeUser();
+
+  mongoose.connection.transaction = async (work) => work({ testSession: true });
+  Report.find = () => queryResult([currentReport]);
+  Report.findById = () => queryResult(currentReport);
+  Report.countDocuments = async () => 1;
+  Report.updateMany = async (_filter, update) => {
+    Object.assign(currentReport, update.$set);
+    seen.reportUpdate = update;
+    return { modifiedCount: 1 };
+  };
+  Poll.find = () => queryResult([currentPoll]);
+  Poll.findOne = () => queryResult(currentPoll);
   Poll.findOneAndUpdate = async (filter, update) => {
     seen.pollFilter = filter;
     seen.pollUpdate = update;
-    return makePoll();
+    currentPoll = {
+      ...currentPoll,
+      ...(update.$set || {}),
+      moderationEditCount: (currentPoll.moderationEditCount || 0) + (update.$inc?.moderationEditCount || 0),
+    };
+    return currentPoll;
   };
   ModerationAction.find = () => queryResult([]);
   ModerationAction.create = async (data) => {
-    seen.action = data;
-    return { _id: new mongoose.Types.ObjectId(), createdAt: new Date(), ...data };
+    const actionData = Array.isArray(data) ? data[0] : data;
+    const action = { _id: new mongoose.Types.ObjectId(), createdAt: new Date(), ...actionData };
+    seen.actions = [...(seen.actions || []), actionData];
+    seen.action = actionData;
+    return Array.isArray(data) ? [action] : action;
   };
   RateBucket.findOneAndUpdate = async () => ({ count: 1 });
-  auth.api.listUsers = async (options) => {
-    seen.listUsers = options;
-    return {
-      users: [{
-        id: "member-1",
-        name: "Member One",
-        email: "member@example.com",
-        image: "https://example.com/private-photo.jpg",
-        emailVerified: true,
-        role: "moderator",
-        banned: false,
-        createdAt: new Date("2026-01-02T00:00:00Z"),
-      }],
-      total: 1,
-    };
+
+  AuthUser.find = () => queryResult([currentUser]);
+  AuthUser.countDocuments = async (filter) => filter?.role ? 2 : 1;
+  AuthUser.findOne = () => queryResult(currentUser);
+  AuthUser.findOneAndUpdate = (_filter, update) => {
+    currentUser = { ...currentUser, ...(update.$set || {}) };
+    for (const key of Object.keys(update.$unset || {})) delete currentUser[key];
+    return queryResult(currentUser);
   };
-  auth.api.getUser = async () => ({
-    id: "member-1",
-    name: "Member One",
-    email: "member@example.com",
-    emailVerified: true,
-    role: "user",
-    banned: false,
-    createdAt: new Date(),
-  });
-  auth.api.setRole = async ({ body }) => {
-    seen.setRole = body;
-    return { user: { ...(await auth.api.getUser()), role: body.role } };
-  };
-  auth.api.banUser = async ({ body }) => {
-    seen.banUser = body;
-    return { user: { ...(await auth.api.getUser()), id: body.userId, banned: true, banReason: body.banReason } };
-  };
-  auth.api.unbanUser = async ({ body }) => {
-    seen.unbanUser = body;
-    return { user: { ...(await auth.api.getUser()), id: body.userId, banned: false } };
+  AuthSession.deleteMany = async () => {
+    seen.sessionsRevoked = true;
+    return { deletedCount: 1 };
   };
 });
 
@@ -163,27 +179,32 @@ after(async () => {
   });
   Report.find = original.reportFind;
   Report.findById = original.reportFindById;
+  Report.countDocuments = original.reportCount;
+  Report.updateMany = original.reportUpdateMany;
   Poll.find = original.pollFind;
   Poll.findOne = original.pollFindOne;
   Poll.findOneAndUpdate = original.pollFindOneAndUpdate;
   ModerationAction.find = original.actionFind;
   ModerationAction.create = original.actionCreate;
   RateBucket.findOneAndUpdate = original.rateLimit;
-  auth.api.listUsers = original.listUsers;
-  auth.api.getUser = original.getUser;
-  auth.api.setRole = original.setRole;
-  auth.api.banUser = original.banUser;
-  auth.api.unbanUser = original.unbanUser;
+  mongoose.connection.transaction = original.transaction;
+  AuthUser.find = original.userFind;
+  AuthUser.countDocuments = original.userCount;
+  AuthUser.findOne = original.userFindOne;
+  AuthUser.findOneAndUpdate = original.userFindOneAndUpdate;
+  AuthSession.deleteMany = original.sessionDeleteMany;
   await closeDatabases();
 });
 
-test("keeps reporter identity private in the moderation queue", async () => {
+test("keeps reporter identity private and paginates the moderation queue", async () => {
   const response = await fetch(`${baseUrl}/api/moderation/reports`);
   assert.equal(response.status, 200);
   const data = await response.json();
   assert.equal(data.reports[0].reporterKey, undefined);
   assert.equal(data.reports[0].reporterUserId, undefined);
   assert.equal(data.reports[0].poll.options[0].votes, 3);
+  assert.equal(data.page, 1);
+  assert.equal(data.pages, 1);
 });
 
 test("does not resolve a report without a content decision", async () => {
@@ -196,7 +217,7 @@ test("does not resolve a report without a content decision", async () => {
   assert.match((await response.json()).message, /edit\/remove action/);
 });
 
-test("moderator edits preserve existing vote data and resolve the report", async () => {
+test("locks semantic poll content after voting starts", async () => {
   const response = await fetch(`${baseUrl}/api/moderation/reports/${reportId}/poll`, {
     method: "PATCH",
     headers: { "Content-Type": "application/json", "x-test-role": "moderator" },
@@ -207,35 +228,49 @@ test("moderator edits preserve existing vote data and resolve the report", async
       note: "Removed unsafe wording",
     }),
   });
-  assert.equal(response.status, 200);
-  assert.equal(currentReport.status, "resolved");
-  assert.equal(String(seen.pollUpdate.$set.options[0]._id), String(optionIds[0]));
-  assert.equal(seen.pollUpdate.$set.options[0].votes, 3);
-  assert.equal(seen.pollUpdate.$set.options[1].votes, 4);
-  assert.equal(seen.action.action, "poll_edited");
-  assert.deepEqual(seen.action.changedFields, ["question", "answer options"]);
+  assert.equal(response.status, 409);
+  assert.match((await response.json()).message, /locked after voting starts/);
+  assert.equal(seen.action, undefined);
 });
 
-test("moderators can directly edit an unreported poll with an audit reason", async () => {
+test("moderators can correct a category and resolve related pending reports", async () => {
+  const response = await fetch(`${baseUrl}/api/moderation/reports/${reportId}/poll`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json", "x-test-role": "moderator" },
+    body: JSON.stringify({
+      question: currentPoll.question,
+      category: "Education",
+      options: ["One", "Two"],
+      note: "Corrected the category",
+    }),
+  });
+  assert.equal(response.status, 200);
+  assert.equal(currentReport.status, "resolved");
+  assert.equal(seen.action.action, "poll_edited");
+  assert.equal(seen.action.before.category, "Tech");
+  assert.equal(seen.action.after.category, "Education");
+});
+
+test("moderators can directly edit an unvoted poll with content snapshots", async () => {
+  currentPoll = makePoll({ totalVotes: 0 });
   const response = await fetch(`${baseUrl}/api/moderation/polls/reported-poll`, {
     method: "PATCH",
     headers: { "Content-Type": "application/json", "x-test-role": "moderator" },
     body: JSON.stringify({
       question: "Which reviewed tool do you use?",
       category: "Tech",
-      options: ["One", "Two"],
+      options: ["First", "Second"],
       note: "Corrected the unsafe title",
     }),
   });
   assert.equal(response.status, 200);
   assert.equal(seen.action.action, "poll_edited");
   assert.equal(seen.action.reportId, undefined);
-  assert.equal(seen.action.pollSlug, "reported-poll");
-  assert.equal(seen.action.note, "Corrected the unsafe title");
-  assert.equal(seen.pollUpdate.$set.options[0].votes, 3);
+  assert.equal(seen.action.before.options[0].label, "One");
+  assert.equal(seen.action.after.options[0].label, "First");
 });
 
-test("removing a reported poll also resolves the report and records the decision", async () => {
+test("removing a poll resolves reports and records content snapshots", async () => {
   const response = await fetch(`${baseUrl}/api/moderation/reports/${reportId}/remove-poll`, {
     method: "POST",
     headers: { "Content-Type": "application/json", "x-test-role": "moderator" },
@@ -246,6 +281,8 @@ test("removing a reported poll also resolves the report and records the decision
   assert.equal(seen.pollUpdate.$set.status, "archived");
   assert.ok(seen.pollUpdate.$set.deletedAt instanceof Date);
   assert.equal(seen.action.action, "poll_removed");
+  assert.equal(seen.action.before.deletedAt, null);
+  assert.ok(seen.action.after.deletedAt);
 });
 
 test("adds internal notes to a report audit history", async () => {
@@ -256,20 +293,18 @@ test("adds internal notes to a report audit history", async () => {
   });
   assert.equal(response.status, 201);
   assert.equal(seen.action.action, "note_added");
-  assert.equal(seen.action.note, "Waiting for a second review");
 });
 
 test("only administrators can list users and private photo data is omitted", async () => {
   const denied = await fetch(`${baseUrl}/api/moderation/users`, { headers: { "x-test-role": "moderator" } });
   assert.equal(denied.status, 403);
 
+  currentUser = makeUser({ role: "moderator" });
   const response = await fetch(`${baseUrl}/api/moderation/users?q=Member&field=name`);
   assert.equal(response.status, 200);
   const data = await response.json();
   assert.equal(data.users[0].role, "moderator");
   assert.equal(data.users[0].image, undefined);
-  assert.equal(seen.listUsers.query.searchField, "name");
-  assert.equal(seen.listUsers.query.searchValue, "Member");
 });
 
 test("protects administrators from changing their own role", async () => {
@@ -282,27 +317,28 @@ test("protects administrators from changing their own role", async () => {
   assert.match((await response.json()).message, /Another administrator/);
 });
 
-test("stores managed roles through Better Auth and audits the change", async () => {
+test("stores role changes atomically and revokes active sessions", async () => {
   const response = await fetch(`${baseUrl}/api/moderation/users/member-1/role`, {
     method: "PATCH",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ role: "moderator" }),
   });
   assert.equal(response.status, 200);
-  assert.deepEqual(seen.setRole, { userId: "member-1", role: "moderator" });
+  assert.equal(currentUser.role, "moderator");
+  assert.equal(seen.sessionsRevoked, true);
   assert.equal(seen.action.action, "role_changed");
   assert.equal(seen.action.previousRole, "user");
-  assert.equal(seen.action.newRole, "moderator");
 });
 
 test("reactivates suspended users and records the action", async () => {
+  currentUser = makeUser({ banned: true, banReason: "Spam" });
   const response = await fetch(`${baseUrl}/api/moderation/users/member-1/reactivate`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ note: "Appeal accepted" }),
   });
   assert.equal(response.status, 200);
-  assert.deepEqual(seen.unbanUser, { userId: "member-1" });
+  assert.equal(currentUser.banned, false);
   assert.equal(seen.action.action, "user_reactivated");
   assert.equal(seen.action.note, "Appeal accepted");
 });

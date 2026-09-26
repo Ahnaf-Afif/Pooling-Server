@@ -9,8 +9,13 @@ let server;
 let baseUrl;
 
 before(async () => {
-  server = app.listen(0, "127.0.0.1");
-  await new Promise((resolve) => server.once("listening", resolve));
+  let listener;
+  await new Promise((resolve, reject) => {
+    listener = app.listen(0, "127.0.0.1");
+    listener.once("listening", resolve);
+    listener.once("error", reject);
+  });
+  server = listener;
   baseUrl = `http://127.0.0.1:${server.address().port}`;
 });
 

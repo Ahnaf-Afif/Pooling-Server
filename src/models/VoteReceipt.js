@@ -10,6 +10,6 @@ const voteReceiptSchema = new mongoose.Schema(
 );
 
 voteReceiptSchema.index({ pollSlug: 1, voterKey: 1 }, { unique: true });
-voteReceiptSchema.index({ createdAt: 1 }, { expireAfterSeconds: 60 * 60 * 24 * 365 * 2 });
+voteReceiptSchema.index({ createdAt: 1 });
 
 export default mongoose.model("VoteReceipt", voteReceiptSchema);

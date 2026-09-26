@@ -1,6 +1,8 @@
 import mongoose from "mongoose";
 import { MongoClient } from "mongodb";
 
+mongoose.set("autoIndex", false);
+
 let connectionPromise;
 let mongoClient;
 
@@ -12,7 +14,10 @@ export function getMongoClient() {
   if (!mongoClient) {
     mongoClient = new MongoClient(getMongoUri(), {
       maxPoolSize: 10,
+      maxIdleTimeMS: 60_000,
+      connectTimeoutMS: 10_000,
       serverSelectionTimeoutMS: 10000,
+      socketTimeoutMS: 15_000,
     });
   }
   return mongoClient;
@@ -29,10 +34,11 @@ export function connectDatabase() {
     const uri = process.env.MONGODB_URI?.trim();
     if (!uri) return Promise.reject(new Error("MONGODB_URI is required"));
 
-    connectionPromise = mongoose.connect(uri, {
-      serverSelectionTimeoutMS: 10000,
-      maxPoolSize: 10,
-    }).finally(() => {
+    connectionPromise = (async () => {
+      const client = getMongoClient();
+      await client.connect();
+      mongoose.connection.setClient(client);
+    })().finally(() => {
       connectionPromise = undefined;
     });
   }
@@ -40,10 +46,17 @@ export function connectDatabase() {
   return connectionPromise;
 }
 
+export function withDatabaseTransaction(work) {
+  return mongoose.connection.transaction(work, {
+    readPreference: "primary",
+    readConcern: { level: "snapshot" },
+    writeConcern: { w: "majority" },
+  });
+}
+
 export async function closeDatabases() {
-  await Promise.all([
-    mongoose.disconnect(),
-    mongoClient?.close(),
-  ]);
+  if (mongoose.connection.readyState !== 0) await mongoose.disconnect();
+  else await mongoClient?.close();
+  connectionPromise = undefined;
   mongoClient = undefined;
 }

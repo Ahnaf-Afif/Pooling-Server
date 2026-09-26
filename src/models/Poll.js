@@ -32,6 +32,8 @@ const pollSchema = new mongoose.Schema(
     },
     closedAt: { type: Date, default: null },
     deletedAt: { type: Date, default: null, index: true },
+    moderatedAt: { type: Date, default: null },
+    moderationEditCount: { type: Number, default: 0, min: 0 },
   },
   {
     timestamps: true,
