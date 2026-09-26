@@ -11,6 +11,7 @@ import { getClientOrigins } from "./config.js";
 import { connectDatabase, getMongoDatabase } from "./db.js";
 import moderationRoutes from "./routes/moderation.js";
 import accountRoutes from "./routes/account.js";
+import securityRoutes from "./routes/security.js";
 import pollRoutes from "./routes/polls.js";
 
 export function createApp(clientOrigins = getClientOrigins()) {
@@ -47,7 +48,7 @@ export function createApp(clientOrigins = getClientOrigins()) {
   app.use("/api", async (request, response, next) => {
     try {
       await connectDatabase();
-      cleanupAuthRateLimitRecords().catch((error) => {
+      await cleanupAuthRateLimitRecords().catch((error) => {
         console.error(JSON.stringify({ level: "warn", event: "auth_rate_limit_cleanup_failed", requestId: request.id, error: error.message }));
       });
       next();
@@ -73,6 +74,7 @@ export function createApp(clientOrigins = getClientOrigins()) {
   app.get("/api/auth-config", (_, response) => {
     response.json(getAuthConfiguration());
   });
+  app.use("/api/account/security", securityRoutes);
   app.use("/api/account", accountRoutes);
   app.use("/api/polls", pollRoutes);
   app.use("/api/moderation", moderationRoutes);

@@ -31,10 +31,9 @@ function parseCookies(header = "") {
 }
 
 function readSignedVoter(request) {
-  const [value, suppliedSignature] = (parseCookies(request.headers.cookie)[COOKIE_NAME] || "").split(".");
-  if (!value || !suppliedSignature) return null;
+  const [value, suppliedSignature, extra] = (parseCookies(request.headers.cookie)[COOKIE_NAME] || "").split(".");
+  if (!/^[0-9a-f-]{36}$/.test(value || "") || !/^[A-Za-z0-9_-]{43}$/.test(suppliedSignature || "") || extra !== undefined) return null;
   const expected = signature(value);
-  if (suppliedSignature.length !== expected.length) return null;
   return timingSafeEqual(Buffer.from(suppliedSignature), Buffer.from(expected)) ? value : null;
 }
 

@@ -1,4 +1,4 @@
-import "dotenv/config";
+import { pathToFileURL } from "node:url";
 
 import { closeDatabases, connectDatabase, getMongoDatabase } from "../src/db.js";
 import ModerationAction from "../src/models/ModerationAction.js";
@@ -6,8 +6,10 @@ import Poll from "../src/models/Poll.js";
 import RateBucket from "../src/models/RateBucket.js";
 import Report from "../src/models/Report.js";
 import VoteReceipt from "../src/models/VoteReceipt.js";
+import AdminGuard from "../src/models/AdminGuard.js";
 
-const apply = process.argv.includes("--apply");
+const models = [Poll, VoteReceipt, Report, ModerationAction, RateBucket, AdminGuard];
+const migrationId = "2026-09-security-indexes-v2";
 
 const nativeIndexes = {
   user: [
@@ -23,6 +25,9 @@ const nativeIndexes = {
   account: [
     [{ providerId: 1, accountId: 1 }, { name: "account_provider_unique", unique: true }],
     [{ userId: 1 }, { name: "account_user" }],
+  ],
+  twoFactor: [
+    [{ userId: 1 }, { name: "two_factor_user_unique", unique: true }],
   ],
   verification: [
     [{ identifier: 1 }, { name: "verification_identifier" }],
@@ -45,14 +50,25 @@ async function assertNoDuplicates(collectionName, fields) {
   if (duplicates) throw new Error(`Cannot create a unique ${collectionName} index until duplicate records are resolved`);
 }
 
-async function prepareChangedIndexes() {
-  const reportIndexes = await Report.collection.indexes();
+async function listIndexes(collection) {
+  try { return await collection.indexes(); }
+  catch (error) { if (error.code === 26) return []; throw error; }
+}
+
+async function prepareChangedIndexes(apply) {
+  const reportIndexes = await listIndexes(Report.collection);
   if (reportIndexes.some((index) => index.name === "pollSlug_1_reporterKey_1")) {
     console.log("reports: replace permanent reporter uniqueness with pending-only uniqueness");
-    if (apply) await Report.collection.dropIndex("pollSlug_1_reporterKey_1");
+    if (apply) {
+      // Install the replacement first, keeping duplicate protection throughout.
+      await Report.collection.createIndex({ pollSlug: 1, reporterKey: 1 }, {
+        name: "unique_pending_reporter_per_poll", unique: true, partialFilterExpression: { status: "pending" },
+      });
+      await Report.collection.dropIndex("pollSlug_1_reporterKey_1");
+    }
   }
 
-  const receiptIndexes = await VoteReceipt.collection.indexes();
+  const receiptIndexes = await listIndexes(VoteReceipt.collection);
   const receiptCreatedAt = receiptIndexes.find((index) => index.name === "createdAt_1");
   if (receiptCreatedAt?.expireAfterSeconds !== undefined) {
     console.log("votereceipts: preserve receipts for the lifetime of their poll");
@@ -60,20 +76,22 @@ async function prepareChangedIndexes() {
   }
 }
 
-async function syncMongooseIndexes() {
-  const models = [Poll, VoteReceipt, Report, ModerationAction, RateBucket];
+async function syncMongooseIndexes(apply) {
   for (const model of models) {
     console.log(`${model.collection.collectionName}: ensure declared indexes`);
     if (apply) await model.createIndexes();
   }
 }
 
-async function syncNativeIndexes() {
+async function checkDuplicates() {
   await assertNoDuplicates("user", ["email"]);
   await assertNoDuplicates("session", ["token"]);
   await assertNoDuplicates("account", ["providerId", "accountId"]);
+  await assertNoDuplicates("twoFactor", ["userId"]);
   await assertNoDuplicates("rateLimit", ["key"]);
+}
 
+async function syncNativeIndexes(apply) {
   for (const [collectionName, indexes] of Object.entries(nativeIndexes)) {
     const collection = getMongoDatabase().collection(collectionName);
     for (const [keys, options] of indexes) {
@@ -83,12 +101,44 @@ async function syncNativeIndexes() {
   }
 }
 
-try {
-  await connectDatabase();
-  await prepareChangedIndexes();
-  await syncMongooseIndexes();
-  await syncNativeIndexes();
-  console.log(apply ? "Database indexes synchronized" : "Dry run complete; add --apply to change indexes");
-} finally {
-  await closeDatabases();
+export async function verifyIndexes() {
+  const declarations = models.map((model) => [model.collection.collectionName, model.schema.indexes()]);
+  const missing = [];
+  for (const [name, indexes] of [...declarations, ...Object.entries(nativeIndexes)]) {
+    const current = await listIndexes(getMongoDatabase().collection(name));
+    for (const [keys, options] of indexes) {
+      const match = current.find((index) => JSON.stringify(index.key) === JSON.stringify(keys)
+        && Boolean(index.unique) === Boolean(options.unique)
+        && index.expireAfterSeconds === options.expireAfterSeconds
+        && JSON.stringify(index.partialFilterExpression) === JSON.stringify(options.partialFilterExpression));
+      if (!match) missing.push(`${name}: ${JSON.stringify(keys)}`);
+    }
+  }
+  if (missing.length) throw new Error(`Missing or mismatched required indexes:\n${missing.join("\n")}`);
+}
+
+export async function syncIndexes({ apply = false, verify = false } = {}) {
+  if (verify) { await verifyIndexes(); return; }
+  await checkDuplicates();
+  await prepareChangedIndexes(apply);
+  await syncMongooseIndexes(apply);
+  await syncNativeIndexes(apply);
+  if (apply) {
+    await AdminGuard.updateOne({ _id: "administrators" }, { $setOnInsert: { revision: 0 } }, { upsert: true });
+    await verifyIndexes();
+    await getMongoDatabase().collection("migrations").updateOne(
+      { _id: migrationId }, { $setOnInsert: { appliedAt: new Date() } }, { upsert: true },
+    );
+  }
+}
+
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  await import("dotenv/config");
+  try {
+    await connectDatabase();
+    const apply = process.argv.includes("--apply");
+    const verify = process.argv.includes("--verify");
+    await syncIndexes({ apply, verify });
+    console.log(verify ? "Required database indexes verified" : apply ? "Database indexes synchronized and verified" : "Dry run complete; add --apply to change indexes");
+  } finally { await closeDatabases(); }
 }

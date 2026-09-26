@@ -1,8 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { Router } from "express";
-import { ObjectId } from "mongodb";
 
-import { requireVerifiedUser } from "../auth-middleware.js";
+import { requireRecentAuth, requireVerifiedUser } from "../auth-middleware.js";
 import { withDatabaseTransaction, getMongoDatabase } from "../db.js";
 import AuthSession from "../models/AuthSession.js";
 import AuthUser from "../models/AuthUser.js";
@@ -12,19 +11,18 @@ import Report from "../models/Report.js";
 import VoteReceipt from "../models/VoteReceipt.js";
 import { limitWrites } from "../rate-limit.js";
 import { getAccountVoterKey } from "../voter.js";
+import { assertAdminWillRemain, idCandidates, lockAdminChanges, UserAdminError } from "../services/user-admin.js";
 
 const router = Router();
-
-function idCandidates(value) {
-  const candidates = [value];
-  if (ObjectId.isValid(value)) candidates.push(new ObjectId(value));
-  return candidates;
-}
 
 function accountFilter(userId) {
   return { _id: { $in: idCandidates(userId) } };
 }
 
+router.use((_request, response, next) => {
+  response.set("Cache-Control", "private, no-store");
+  next();
+});
 router.use(requireVerifiedUser);
 
 router.get("/export", async (request, response, next) => {
@@ -59,23 +57,17 @@ router.get("/export", async (request, response, next) => {
   }
 });
 
-router.post("/delete", limitWrites, async (request, response, next) => {
+router.post("/delete", requireRecentAuth, limitWrites, async (request, response, next) => {
   try {
     if (request.body?.confirmation !== "DELETE") {
       return response.status(400).json({ message: "Type DELETE to confirm account removal" });
     }
     const userId = request.auth.user.id;
     await withDatabaseTransaction(async (session) => {
+      await lockAdminChanges(session);
       const user = await AuthUser.findOne(accountFilter(userId)).session(session).lean();
       if (!user) return;
-      if (String(user.role || "") === "admin") {
-        const activeAdminCount = await AuthUser.countDocuments({ role: "admin", banned: { $ne: true } }).session(session);
-        if (activeAdminCount <= 1) {
-          const error = new Error("Create another active administrator before deleting this account");
-          error.status = 409;
-          throw error;
-        }
-      }
+      await assertAdminWillRemain(user, { session });
 
       const now = new Date();
       await Poll.updateMany(
@@ -85,13 +77,19 @@ router.post("/delete", limitWrites, async (request, response, next) => {
       );
       await Report.updateMany(
         { reporterUserId: userId },
-        { $set: { reporterUserId: null } },
+        { $set: { reporterUserId: null, reporterKey: `deleted:${randomUUID()}` } },
         { session },
       );
+      await Report.updateMany({ reviewedBy: userId }, { $set: { reviewedBy: null } }, { session });
       const anonymizedActorId = `deleted:${randomUUID()}`;
       await ModerationAction.updateMany(
-        { $or: [{ targetUserId: userId }, { actorId: userId }] },
-        { $set: { targetUserId: null, actorId: anonymizedActorId, actorName: "Deleted user" } },
+        { targetUserId: userId },
+        { $set: { targetUserId: null } },
+        { session },
+      );
+      await ModerationAction.updateMany(
+        { actorId: userId },
+        { $set: { actorId: anonymizedActorId, actorName: "Deleted user" } },
         { session },
       );
 
@@ -102,13 +100,16 @@ router.post("/delete", limitWrites, async (request, response, next) => {
         { session },
       );
       await AuthSession.deleteMany({ userId: { $in: idCandidates(userId) } }, { session });
-      await getMongoDatabase().collection("account").deleteMany({ userId }, { session });
+      const database = getMongoDatabase();
+      const userFilter = { userId: { $in: idCandidates(userId) } };
+      await database.collection("account").deleteMany(userFilter, { session });
+      await database.collection("twoFactor").deleteMany(userFilter, { session });
       await getMongoDatabase().collection("verification").deleteMany({ identifier: user.email }, { session });
       await AuthUser.deleteOne({ _id: user._id }, { session });
     });
     return response.status(204).end();
   } catch (error) {
-    if (error.status === 409) return response.status(409).json({ message: error.message });
+    if (error instanceof UserAdminError) return response.status(error.status).json({ message: error.message });
     return next(error);
   }
 });

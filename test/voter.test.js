@@ -38,3 +38,18 @@ test("uses the account identity for a signed-in voter", () => {
   assert.equal(first, second);
   assert.notEqual(first, different);
 });
+
+test("malformed, tampered and non-ASCII cookies are replaced safely", () => {
+  const original = responseRecorder();
+  const originalKey = getVoterKey({ headers: {} }, original, null);
+  const [id, signature] = original.cookieValue.split(".");
+  for (const value of [
+    `${id}.${"é".repeat(43)}`, `${id}.${"x".repeat(43)}`,
+    `${id}.${signature}.extra`, `invalid.${signature}`, "%broken", "",
+  ]) {
+    const response = responseRecorder();
+    const key = getVoterKey({ headers: { cookie: `wdyt_voter=${encodeURIComponent(value)}` } }, response, null);
+    assert.ok(response.cookieValue);
+    assert.notEqual(key, originalKey);
+  }
+});

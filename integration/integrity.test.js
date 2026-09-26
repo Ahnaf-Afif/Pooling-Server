@@ -1,0 +1,282 @@
+import assert from "node:assert/strict";
+import { after, before, beforeEach, test } from "node:test";
+import { ObjectId } from "mongodb";
+import { makeSignature, symmetricDecrypt } from "better-auth/crypto";
+import { createOTP } from "@better-auth/utils/otp";
+import { MongoMemoryReplSet } from "mongodb-memory-server";
+
+// Always create an isolated local replica set. Never read .env or reuse Atlas.
+let replicaSet, server, baseUrl, database, auth, closeDatabases, withDatabaseTransaction;
+let Poll, Report, ModerationAction, VoteReceipt, AdminGuard, setAuthUserRole;
+const secret = "integration-test-secret-only-0123456789abcdef";
+
+before(async () => {
+  replicaSet = await MongoMemoryReplSet.create({
+    binary: {
+      version: "7.0.24",
+      downloadDir: process.env.MONGOMS_DOWNLOAD_DIR || "/tmp/wdyt-mongodb-binaries",
+      os: { os: "linux", dist: "ubuntu", release: "22.04" },
+    },
+    replSet: { count: 1, storageEngine: "wiredTiger" },
+  });
+  process.env.MONGODB_URI = replicaSet.getUri("wdyt_integration");
+  process.env.NODE_ENV = "test";
+  process.env.BETTER_AUTH_SECRET = secret;
+  process.env.BETTER_AUTH_URL = "http://localhost:3000";
+  delete process.env.BETTER_AUTH_SECRETS;
+  delete process.env.RESEND_API_KEY;
+  delete process.env.GOOGLE_CLIENT_SECRET;
+  const db = await import("../src/db.js");
+  closeDatabases = db.closeDatabases;
+  withDatabaseTransaction = db.withDatabaseTransaction;
+  await db.connectDatabase();
+  database = db.getMongoDatabase();
+  ({ default: Poll } = await import("../src/models/Poll.js"));
+  ({ default: Report } = await import("../src/models/Report.js"));
+  ({ default: ModerationAction } = await import("../src/models/ModerationAction.js"));
+  ({ default: VoteReceipt } = await import("../src/models/VoteReceipt.js"));
+  ({ default: AdminGuard } = await import("../src/models/AdminGuard.js"));
+  ({ setAuthUserRole } = await import("../src/services/user-admin.js"));
+  ({ auth } = await import("../src/auth.js"));
+  const { default: app } = await import("../src/app.js");
+  for (const model of [Poll, Report, ModerationAction, VoteReceipt, AdminGuard]) await model.createIndexes();
+  const { syncIndexes } = await import("../scripts/sync-indexes.js");
+  await syncIndexes({ apply: true });
+  await new Promise((resolve, reject) => {
+    server = app.listen(0, "127.0.0.1", resolve);
+    server.once("error", reject);
+  });
+  baseUrl = `http://127.0.0.1:${server.address().port}`;
+}, { timeout: 180_000 });
+
+beforeEach(async () => {
+  // Every collection here belongs to the temporary replica set above.
+  for (const collection of await database.collections()) await collection.deleteMany({});
+  await AdminGuard.create({ _id: "administrators", revision: 0 });
+});
+
+after(async () => {
+  if (server) await new Promise((resolve) => { server.close(resolve); server.closeAllConnections(); });
+  await closeDatabases?.();
+  await replicaSet?.stop();
+});
+
+async function createUser(role = "user") {
+  const _id = new ObjectId();
+  await database.collection("user").insertOne({
+    _id, name: `Test ${role}`, email: `${_id}@example.test`, emailVerified: true,
+    role, banned: false, createdAt: new Date(), updatedAt: new Date(),
+  });
+  const context = await auth.$context;
+  const session = await context.internalAdapter.createSession(String(_id), false);
+  const signed = `${session.token}.${await makeSignature(session.token, secret)}`;
+  return { id: String(_id), _id, cookie: `better-auth.session_token=${encodeURIComponent(signed)}` };
+}
+
+async function createPoll(creatorId = null) {
+  return Poll.create({ slug: `test-${new ObjectId()}`, question: "Which option do you prefer?", category: "Tech", creatorId, options: [{ label: "One" }, { label: "Two" }] });
+}
+
+function post(path, cookie, body = {}) {
+  return fetch(`${baseUrl}${path}`, {
+    method: "POST", headers: { "Content-Type": "application/json", Origin: "http://localhost:3000", ...(cookie ? { Cookie: cookie } : {}) },
+    body: JSON.stringify(body),
+  });
+}
+
+test("account deletion preserves other moderators' attribution and clears both ID formats", async () => {
+  const user = await createUser("moderator");
+  const poll = await createPoll(user.id);
+  const targetAction = await ModerationAction.create({ action: "user_suspended", actorId: "other-admin", actorName: "Other admin", actorRole: "admin", targetUserId: user.id });
+  const authoredAction = await ModerationAction.create({ action: "poll_edited", actorId: user.id, actorName: "Deleting moderator", actorRole: "moderator", targetUserId: "another-owner", pollSlug: poll.slug });
+  await database.collection("account").insertMany([{ userId: user._id, providerId: "google" }, { userId: user.id, providerId: "legacy" }]);
+  await database.collection("twoFactor").insertOne({ userId: user._id, secret: "test-only" });
+  const { getAccountVoterKey } = await import("../src/voter.js");
+  const voterKey = getAccountVoterKey(user.id);
+  await VoteReceipt.create({ pollSlug: poll.slug, voterKey, optionId: poll.options[0]._id });
+  const report = await Report.create({ pollSlug: poll.slug, reporterKey: voterKey, reporterUserId: user.id, reviewedBy: user.id, reason: "spam" });
+
+  const response = await post("/api/account/delete", user.cookie, { confirmation: "DELETE" });
+  assert.equal(response.status, 204, await response.text());
+  const keptActor = await ModerationAction.findById(targetAction._id).lean();
+  assert.equal(keptActor.actorId, "other-admin");
+  assert.equal(keptActor.actorName, "Other admin");
+  assert.equal(keptActor.targetUserId, null);
+  const removedActor = await ModerationAction.findById(authoredAction._id).lean();
+  assert.match(removedActor.actorId, /^deleted:/);
+  assert.equal(removedActor.targetUserId, "another-owner");
+  const removedReport = await Report.findById(report._id).lean();
+  assert.equal(removedReport.reviewedBy, null);
+  assert.equal(removedReport.reporterUserId, null);
+  assert.notEqual(removedReport.reporterKey, voterKey);
+  for (const collection of ["user", "session", "account", "twoFactor"]) assert.equal(await database.collection(collection).countDocuments({}), 0, collection);
+  assert.equal(await VoteReceipt.countDocuments({ voterKey }), 0);
+  assert.equal(await VoteReceipt.countDocuments({}), 1);
+  assert.equal((await Poll.findById(poll._id)).creatorId, null);
+  assert.equal((await fetch(`${baseUrl}/api/account/export`, { headers: { Cookie: user.cookie } })).status, 401);
+});
+
+test("deleting the last administrator is rejected without deleting anything", async () => {
+  const admin = await createUser("admin");
+  const response = await post("/api/account/delete", admin.cookie, { confirmation: "DELETE" });
+  assert.equal(response.status, 409);
+  assert.equal(await database.collection("user").countDocuments({}), 1);
+  assert.equal(await database.collection("session").countDocuments({}), 1);
+});
+
+test("concurrent demotions cannot remove every administrator", async () => {
+  const admins = await Promise.all([createUser("admin"), createUser("admin")]);
+  const results = await Promise.allSettled(admins.map((admin) => withDatabaseTransaction((session) => setAuthUserRole(admin.id, "user", { session }))));
+  assert.equal(results.filter((result) => result.status === "fulfilled").length, 1);
+  assert.equal(await database.collection("user").countDocuments({ role: "admin" }), 1);
+});
+
+test("concurrent duplicate votes create exactly one receipt and one count", async () => {
+  const user = await createUser();
+  const poll = await createPoll();
+  const responses = await Promise.all(Array.from({ length: 8 }, () => post(`/api/polls/${poll.slug}/votes`, user.cookie, { optionId: String(poll.options[0]._id) })));
+  assert.equal(responses.filter((response) => response.status === 200).length, 1);
+  assert.equal(responses.filter((response) => response.status === 409).length, 7);
+  assert.equal(await VoteReceipt.countDocuments({ pollSlug: poll.slug }), 1);
+  const saved = await Poll.findById(poll._id);
+  assert.equal(saved.totalVotes, 1);
+  assert.equal(saved.options[0].votes, 1);
+});
+
+test("a rejected vote rolls back its receipt", async () => {
+  const user = await createUser();
+  const poll = await createPoll();
+  poll.status = "closed";
+  await poll.save();
+  const response = await post(`/api/polls/${poll.slug}/votes`, user.cookie, { optionId: String(poll.options[0]._id) });
+  assert.equal(response.status, 409);
+  assert.equal(await VoteReceipt.countDocuments({}), 0);
+  assert.equal((await Poll.findById(poll._id)).totalVotes, 0);
+});
+
+test("a failed audit insert rolls back poll removal and report resolution", async () => {
+  const admin = await createUser("admin");
+  await database.collection("user").updateOne({ _id: admin._id }, { $set: { twoFactorEnabled: true } });
+  await database.collection("session").updateMany({}, { $set: { mfaVerifiedAt: new Date() } });
+  const poll = await createPoll();
+  const report = await Report.create({ pollSlug: poll.slug, reporterKey: "reporter", reason: "spam" });
+  const original = ModerationAction.create;
+  ModerationAction.create = async () => { throw new Error("Injected audit storage failure"); };
+  try {
+    const response = await post(`/api/moderation/reports/${report._id}/remove-poll`, admin.cookie, { note: "Test rollback" });
+    assert.equal(response.status, 500);
+    assert.equal((await Poll.findById(poll._id)).deletedAt, null);
+    assert.equal((await Report.findById(report._id)).status, "pending");
+    assert.equal(await ModerationAction.countDocuments({}), 0);
+  } finally { ModerationAction.create = original; }
+});
+
+function updatedCookie(response, fallback) {
+  return response.headers.getSetCookie().find((cookie) => cookie.startsWith("better-auth.session_token="))?.split(";", 1)[0] || fallback;
+}
+
+test("Google-style staff sessions need MFA; enrollment and recovery unlock only the verified session", async () => {
+  const admin = await createUser("admin");
+  const readQueue = (cookie) => fetch(`${baseUrl}/api/moderation/reports`, { headers: { Cookie: cookie } });
+  assert.equal((await readQueue(admin.cookie)).status, 403);
+  const enrollment = await post("/api/account/security/enable", admin.cookie);
+  assert.equal(enrollment.status, 200, await enrollment.clone().text());
+  const { backupCodes } = await enrollment.json();
+  const record = await database.collection("twoFactor").findOne({});
+  const context = await auth.$context;
+  const totpSecret = await symmetricDecrypt({ key: context.secretConfig, data: record.secret });
+  const code = await createOTP(totpSecret).totp();
+  const verified = await post("/api/account/security/verify", admin.cookie, { code });
+  assert.equal(verified.status, 200, await verified.clone().text());
+  const cookie = updatedCookie(verified, admin.cookie);
+  assert.equal((await readQueue(cookie)).status, 200);
+
+  // An independent Google session has no second-factor proof.
+  const second = await context.internalAdapter.createSession(admin.id, false);
+  const secondCookie = `better-auth.session_token=${encodeURIComponent(`${second.token}.${await makeSignature(second.token, secret)}`)}`;
+  assert.equal((await readQueue(secondCookie)).status, 403);
+  assert.equal((await post("/api/account/security/verify", secondCookie, { code })).status, 409);
+  const recovered = await post("/api/account/security/verify", secondCookie, { code: backupCodes[0], backup: true });
+  assert.equal(recovered.status, 200, await recovered.clone().text());
+  assert.equal((await readQueue(secondCookie)).status, 200);
+  assert.equal((await post("/api/account/security/verify", secondCookie, { code: backupCodes[0], backup: true })).status, 401);
+  assert.equal((await post("/api/account/security/disable", secondCookie)).status, 403);
+
+  await database.collection("session").updateOne({ token: second.token }, { $set: { mfaVerifiedAt: new Date(Date.now() - 16 * 60_000) } });
+  assert.equal((await post("/api/moderation/users/nobody/suspend", secondCookie, { note: "Must require a fresh factor" })).status, 403);
+  await database.collection("session").updateOne({ token: second.token }, { $set: { createdAt: new Date(Date.now() - 13 * 60 * 60_000) } });
+  assert.equal((await readQueue(secondCookie)).status, 403);
+});
+
+test("old sessions cannot delete accounts or enroll a new authenticator", async () => {
+  const user = await createUser();
+  await database.collection("session").updateMany({}, { $set: { createdAt: new Date(Date.now() - 16 * 60_000) } });
+  assert.equal((await post("/api/account/delete", user.cookie, { confirmation: "DELETE" })).status, 403);
+  assert.equal((await post("/api/account/security/enable", user.cookie)).status, 403);
+  assert.equal(await database.collection("user").countDocuments({}), 1);
+});
+
+test("session list omits credentials and revocation cannot target another account", async () => {
+  const first = await createUser();
+  const other = await createUser();
+  const context = await auth.$context;
+  await context.internalAdapter.createSession(first.id, false);
+  const result = await fetch(`${baseUrl}/api/account/security/sessions`, { headers: { Cookie: first.cookie } });
+  const data = await result.json();
+  assert.equal(data.sessions.length, 2);
+  assert.ok(data.sessions.every((session) => !session.token && !session.userId));
+  const otherSession = await database.collection("session").findOne({ userId: other._id });
+  await post("/api/account/security/sessions/revoke", first.cookie, { id: String(otherSession._id) });
+  assert.ok(await database.collection("session").findOne({ _id: otherSession._id }));
+  await post("/api/account/security/sessions/revoke", first.cookie, { others: true });
+  assert.equal(await database.collection("session").countDocuments({ userId: first._id }), 1);
+});
+
+test("built-in privileged endpoints are disabled even for an authenticated administrator", async () => {
+  const admin = await createUser("admin");
+  const paths = auth.options.disabledPaths;
+  assert.ok(paths.length >= 15);
+  for (const path of paths) {
+    const response = await post(`/api/auth${path}`, admin.cookie, { userId: admin.id, role: "user" });
+    assert.equal(response.status, 404, path);
+  }
+  const sessionCount = await database.collection("session").countDocuments({});
+  for (const path of ["list-sessions", "revoke-session", "revoke-sessions", "revoke-other-sessions"]) {
+    const response = await fetch(`${baseUrl}/api/auth/${path}`, { headers: { Cookie: admin.cookie } });
+    assert.equal(response.status, 404, `GET ${path}`);
+  }
+  assert.equal(await database.collection("session").countDocuments({}), sessionCount);
+  assert.equal((await database.collection("user").findOne({ _id: admin._id })).role, "admin");
+});
+
+test("suspension preserves pending reports; already removed content can then be resolved", async () => {
+  const admin = await createUser("admin");
+  const owner = await createUser();
+  await database.collection("user").updateOne({ _id: admin._id }, { $set: { twoFactorEnabled: true } });
+  await database.collection("session").updateMany({ userId: admin._id }, { $set: { mfaVerifiedAt: new Date() } });
+  const poll = await createPoll(owner.id);
+  const report = await Report.create({ pollSlug: poll.slug, reporterKey: "reporter", reason: "spam" });
+  const suspended = await post(`/api/moderation/reports/${report._id}/suspend-owner`, admin.cookie, { note: "Repeated spam" });
+  assert.equal(suspended.status, 200, await suspended.text());
+  assert.equal((await database.collection("user").findOne({ _id: owner._id })).banned, true);
+  assert.equal(await database.collection("session").countDocuments({ userId: owner._id }), 0);
+  assert.equal((await Report.findById(report._id)).status, "pending");
+  assert.equal((await Poll.findById(poll._id)).deletedAt, null);
+  assert.equal(await ModerationAction.countDocuments({ action: "owner_suspended", reportId: report._id }), 1);
+
+  await Poll.updateOne({ _id: poll._id }, { $set: { deletedAt: new Date(), status: "archived" } });
+  const removed = await post(`/api/moderation/reports/${report._id}/remove-poll`, admin.cookie, { note: "Content already removed" });
+  assert.equal(removed.status, 200, await removed.text());
+  assert.equal((await Report.findById(report._id)).status, "resolved");
+  assert.equal(await ModerationAction.countDocuments({ action: "poll_removed", reportId: report._id }), 1);
+});
+
+test("required-index verification detects drift and migration repairs it", async () => {
+  const { syncIndexes, verifyIndexes } = await import("../scripts/sync-indexes.js");
+  await verifyIndexes();
+  await database.collection("twoFactor").dropIndex("two_factor_user_unique");
+  await assert.rejects(verifyIndexes, /twoFactor/);
+  await syncIndexes({ apply: true });
+  await verifyIndexes();
+  assert.equal(await database.collection("migrations").countDocuments({}), 1);
+});

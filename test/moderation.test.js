@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { after, before, beforeEach, test } from "node:test";
+import { startServer, stopServer } from "./helpers/http.js";
 import express from "express";
 import mongoose from "mongoose";
 
@@ -7,6 +8,7 @@ import { closeDatabases } from "../src/db.js";
 import ModerationAction from "../src/models/ModerationAction.js";
 import AuthSession from "../src/models/AuthSession.js";
 import AuthUser from "../src/models/AuthUser.js";
+import AdminGuard from "../src/models/AdminGuard.js";
 import Poll from "../src/models/Poll.js";
 import RateBucket from "../src/models/RateBucket.js";
 import Report from "../src/models/Report.js";
@@ -16,6 +18,7 @@ const reportId = new mongoose.Types.ObjectId();
 const pollId = new mongoose.Types.ObjectId();
 const optionIds = [new mongoose.Types.ObjectId(), new mongoose.Types.ObjectId()];
 const original = {
+  guardUpdate: AdminGuard.updateOne,
   reportFind: Report.find,
   reportFindById: Report.findById,
   reportCount: Report.countDocuments,
@@ -107,21 +110,19 @@ before(async () => {
   app.use((request, _response, next) => {
     const role = request.headers["x-test-role"] || "admin";
     request.auth = {
-      user: { id: "admin-user", name: "Test Admin", email: "admin@example.com", role },
+      user: { id: "admin-user", name: "Test Admin", email: "admin@example.com", role, emailVerified: true, twoFactorEnabled: true },
+      session: { createdAt: new Date(), mfaVerifiedAt: new Date() },
     };
     next();
   });
   app.use("/api/moderation", moderationRoutes);
   app.use((error, _request, response, _next) => response.status(500).json({ message: error.message }));
-  await new Promise((resolve, reject) => {
-    server = app.listen(0, "127.0.0.1");
-    server.once("listening", resolve);
-    server.once("error", reject);
-  });
+  server = await startServer(app);
   baseUrl = `http://127.0.0.1:${server.address().port}`;
 });
 
 beforeEach(() => {
+  AdminGuard.updateOne = async () => ({ modifiedCount: 1 });
   for (const key of Object.keys(seen)) delete seen[key];
   currentPoll = makePoll();
   currentReport = makeReport();
@@ -173,10 +174,8 @@ beforeEach(() => {
 });
 
 after(async () => {
-  await new Promise((resolve) => {
-    server.close(resolve);
-    server.closeAllConnections();
-  });
+  AdminGuard.updateOne = original.guardUpdate;
+  await stopServer(server);
   Report.find = original.reportFind;
   Report.findById = original.reportFindById;
   Report.countDocuments = original.reportCount;
@@ -249,6 +248,7 @@ test("moderators can correct a category and resolve related pending reports", as
   assert.equal(seen.action.action, "poll_edited");
   assert.equal(seen.action.before.category, "Tech");
   assert.equal(seen.action.after.category, "Education");
+  assert.deepEqual(seen.action.changedFields, ["category"]);
 });
 
 test("moderators can directly edit an unvoted poll with content snapshots", async () => {
@@ -295,17 +295,44 @@ test("adds internal notes to a report audit history", async () => {
   assert.equal(seen.action.action, "note_added");
 });
 
-test("suspending a poll owner resolves the related report atomically", async () => {
+test("suspending an owner keeps content reports pending and records the action", async () => {
   const response = await fetch(`${baseUrl}/api/moderation/reports/${reportId}/suspend-owner`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ note: "Repeated abuse" }),
   });
   assert.equal(response.status, 200);
-  assert.equal(currentReport.status, "resolved");
+  assert.equal(currentReport.status, "pending");
   assert.equal(seen.sessionsRevoked, true);
   assert.equal(seen.action.action, "owner_suspended");
-  assert.equal((await response.json()).affectedReports, 1);
+  assert.equal(seen.pollUpdate, undefined);
+  assert.equal(String(seen.action.reportId), String(reportId));
+  assert.match((await response.json()).message, /remain pending/);
+});
+
+test("reports for already-deleted or missing polls can be resolved without another removal", async () => {
+  for (const poll of [{ ...makePoll(), deletedAt: new Date(), status: "archived" }, null]) {
+    currentPoll = poll;
+    currentReport = makeReport();
+    const response = await fetch(`${baseUrl}/api/moderation/reports/${reportId}/remove-poll`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ note: "Content was already removed" }),
+    });
+    assert.equal(response.status, 200);
+    assert.equal(currentReport.status, "resolved");
+    assert.equal(seen.pollUpdate, undefined);
+    assert.equal(seen.action.action, "poll_removed");
+  }
+});
+
+test("repeating a report status does not create another audit entry", async () => {
+  currentReport = makeReport("dismissed");
+  const response = await fetch(`${baseUrl}/api/moderation/reports/${reportId}`, {
+    method: "PATCH", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ status: "dismissed", note: "Already reviewed" }),
+  });
+  assert.equal(response.status, 200);
+  assert.equal(seen.action, undefined);
 });
 
 test("only administrators can list users and private photo data is omitted", async () => {

@@ -10,7 +10,10 @@ async function run(middleware, role) {
         id: "test-user",
         email: "admin-from-old-env@example.com",
         role,
+        emailVerified: true,
+        twoFactorEnabled: true,
       },
+      session: { createdAt: new Date(), mfaVerifiedAt: new Date() },
     },
   };
   const result = { nextCalled: false, status: null, body: null };

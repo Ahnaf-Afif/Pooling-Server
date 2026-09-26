@@ -1,6 +1,6 @@
 import { mongodbAdapter } from "@better-auth/mongo-adapter";
 import { betterAuth } from "better-auth";
-import { admin, magicLink } from "better-auth/plugins";
+import { admin, magicLink, twoFactor } from "better-auth/plugins";
 import { defaultAc, userAc } from "better-auth/plugins/admin/access";
 
 import { getClientOrigins } from "./config.js";
@@ -32,6 +32,8 @@ const adminAc = defaultAc.newRole({
   session: [],
 });
 const disabledAdminPaths = [
+  // Session management must use the app's token-free, step-up guarded routes.
+  "/list-sessions", "/revoke-session", "/revoke-sessions", "/revoke-other-sessions",
   "/admin/create-user",
   "/admin/list-users",
   "/admin/get-user",
@@ -47,6 +49,10 @@ const disabledAdminPaths = [
   "/admin/stop-impersonating",
   "/admin/remove-user",
   "/admin/has-permission",
+  // Only our guarded account routes may manage or verify the second factor.
+  "/two-factor/enable", "/two-factor/disable", "/two-factor/get-totp-uri",
+  "/two-factor/verify-totp", "/two-factor/verify-backup-code",
+  "/two-factor/generate-backup-codes", "/two-factor/send-otp", "/two-factor/verify-otp",
 ];
 
 function getVersionedSecrets() {
@@ -102,6 +108,7 @@ const socialProviders = googleConfigured
   : {};
 
 const plugins = [
+  twoFactor({ allowPasswordless: true, issuer: "What Do You Think?" }),
   ...(magicLinkConfigured
     ? [magicLink({
         expiresIn: 60 * 10,
@@ -133,6 +140,9 @@ export const auth = betterAuth({
   session: {
     expiresIn: 60 * 60 * 24 * 30,
     updateAge: 60 * 60 * 24,
+    additionalFields: {
+      mfaVerifiedAt: { type: "date", required: false, input: false },
+    },
   },
   rateLimit: {
     enabled: true,

@@ -2,6 +2,7 @@ import { ObjectId } from "mongodb";
 
 import AuthSession from "../models/AuthSession.js";
 import AuthUser from "../models/AuthUser.js";
+import AdminGuard from "../models/AdminGuard.js";
 
 const ADMIN_ROLE = /(^|,)admin(,|$)/;
 
@@ -13,7 +14,7 @@ export class UserAdminError extends Error {
   }
 }
 
-function idCandidates(value) {
+export function idCandidates(value) {
   const candidates = [value];
   if (ObjectId.isValid(value)) candidates.push(new ObjectId(value));
   return candidates;
@@ -48,7 +49,18 @@ export async function findAuthUserById(userId, { session } = {}) {
   return serializeAuthUser(user);
 }
 
-async function assertAdminWillRemain(user, { session } = {}) {
+// A shared write prevents snapshot-isolation write skew when two different
+// administrators are demoted, suspended or deleted concurrently.
+export async function lockAdminChanges(session) {
+  if (!session) throw new Error("Administrator changes require a transaction");
+  await AdminGuard.updateOne(
+    { _id: "administrators" },
+    { $inc: { revision: 1 } },
+    { upsert: true, session },
+  );
+}
+
+export async function assertAdminWillRemain(user, { session } = {}) {
   if (!ADMIN_ROLE.test(String(user.role || "")) || user.banned) return;
   const activeAdmins = await AuthUser.countDocuments(
     { role: ADMIN_ROLE, banned: { $ne: true } },
@@ -59,6 +71,7 @@ async function assertAdminWillRemain(user, { session } = {}) {
 }
 
 export async function setAuthUserRole(userId, role, { session } = {}) {
+  await lockAdminChanges(session);
   const current = await AuthUser.findOne(userIdFilter(userId)).session(session || null).lean();
   if (!current) throw new UserAdminError("User not found", 404);
   if (role !== "admin") await assertAdminWillRemain(current, { session });
@@ -75,6 +88,7 @@ export async function setAuthUserRole(userId, role, { session } = {}) {
 }
 
 export async function suspendAuthUser(userId, reason, { session } = {}) {
+  await lockAdminChanges(session);
   const current = await AuthUser.findOne(userIdFilter(userId)).session(session || null).lean();
   if (!current) throw new UserAdminError("User not found", 404);
   await assertAdminWillRemain(current, { session });

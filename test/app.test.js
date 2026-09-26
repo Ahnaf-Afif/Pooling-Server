@@ -4,26 +4,18 @@ import { after, before, test } from "node:test";
 import app from "../src/app.js";
 import { getClientOrigins } from "../src/config.js";
 import { closeDatabases } from "../src/db.js";
+import { startServer, stopServer } from "./helpers/http.js";
 
 let server;
 let baseUrl;
 
 before(async () => {
-  let listener;
-  await new Promise((resolve, reject) => {
-    listener = app.listen(0, "127.0.0.1");
-    listener.once("listening", resolve);
-    listener.once("error", reject);
-  });
-  server = listener;
+  server = await startServer(app);
   baseUrl = `http://127.0.0.1:${server.address().port}`;
 });
 
 after(async () => {
-  await new Promise((resolve) => {
-    server.close(resolve);
-    server.closeAllConnections();
-  });
+  await stopServer(server);
   await closeDatabases();
 });
 

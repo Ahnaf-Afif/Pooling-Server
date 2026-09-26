@@ -23,6 +23,10 @@ const MANAGED_REPORT_STATUSES = ["pending", "dismissed"];
 const USER_ROLES = ["user", "moderator", "admin"];
 const MAX_PAGE = 1000;
 
+router.use((_request, response, next) => {
+  response.set("Cache-Control", "private, no-store");
+  next();
+});
 router.use(requireModerator);
 
 class ModerationRequestError extends Error {
@@ -165,6 +169,9 @@ async function updatePollContent(poll, value, session) {
 }
 
 function sendAdminError(error, response, next) {
+  if (error?.code === 11000) {
+    return response.status(409).json({ message: "A pending report from this reporter already exists. Review that report before reopening this one." });
+  }
   if (error instanceof UserAdminError || error instanceof ModerationRequestError) {
     return response.status(error.status).json({ message: error.message });
   }
@@ -189,7 +196,7 @@ async function findReport(id, { pending = false, session } = {}) {
   return report;
 }
 
-async function resolvePendingReports({ pollSlug, action, actor, targetUserId, note, before, after, session }) {
+async function resolvePendingReports({ pollSlug, action, actor, targetUserId, note, before, after, changedFields = [], session }) {
   const reports = await withSession(Report.find({ pollSlug, status: "pending" }), session);
   if (!reports.length) throw new ModerationRequestError("This report has already been handled", 409);
   const reviewedAt = new Date();
@@ -208,6 +215,7 @@ async function resolvePendingReports({ pollSlug, action, actor, targetUserId, no
       note,
       before,
       after,
+      changedFields,
       affectedReports: reports.length,
     }, session);
   }
@@ -326,6 +334,7 @@ router.patch("/reports/:id", limitWrites, async (request, response, next) => {
     if (error) return response.status(400).json({ message: error });
     await withDatabaseTransaction(async (session) => {
       const report = await findReport(request.params.id, { session });
+      if (report.status === status) return;
       report.status = status;
       report.reviewedBy = status === "dismissed" ? request.auth.user.id : null;
       report.reviewedAt = status === "dismissed" ? new Date() : null;
@@ -385,6 +394,7 @@ router.patch("/reports/:id/poll", limitWrites, async (request, response, next) =
         note,
         before: result.before,
         after: result.after,
+        changedFields: result.changedFields,
         session,
       });
     });
@@ -406,19 +416,18 @@ router.post("/reports/:id/remove-poll", limitWrites, async (request, response, n
     const affectedReports = await withDatabaseTransaction(async (session) => {
       const report = await findReport(request.params.id, { pending: true, session });
       const poll = await withSession(Poll.findOne({ slug: report.pollSlug }), session);
-      if (!poll) throw new ModerationRequestError("Poll not found", 404);
       const before = pollSnapshot(poll);
-      const removedPoll = await Poll.findOneAndUpdate(
+      const removedPoll = !poll || poll.deletedAt ? poll : await Poll.findOneAndUpdate(
         { _id: poll._id, deletedAt: null },
         { $set: { status: "archived", deletedAt: new Date() } },
         { returnDocument: "after", session },
       );
-      if (!removedPoll) throw new ModerationRequestError("Poll changed while it was being reviewed", 409);
+      if (poll && !removedPoll) throw new ModerationRequestError("Poll changed while it was being reviewed", 409);
       return resolvePendingReports({
         pollSlug: report.pollSlug,
         action: "poll_removed",
         actor: actorFrom(request),
-        targetUserId: poll.creatorId || null,
+        targetUserId: poll?.creatorId || null,
         note,
         before,
         after: pollSnapshot(removedPoll),
@@ -440,7 +449,7 @@ router.post("/reports/:id/suspend-owner", requireAdmin, limitWrites, async (requ
   try {
     const { note, error } = cleanNote(request.body);
     if (error) return response.status(400).json({ message: error });
-    const result = await withDatabaseTransaction(async (session) => {
+    await withDatabaseTransaction(async (session) => {
       const report = await findReport(request.params.id, { pending: true, session });
       const poll = await withSession(Poll.findOne({ slug: report.pollSlug }), session);
       if (!poll?.creatorId) {
@@ -452,19 +461,18 @@ router.post("/reports/:id/suspend-owner", requireAdmin, limitWrites, async (requ
 
       const reason = (note || `Poll moderation: ${report.reason}`).slice(0, 200);
       await suspendAuthUser(poll.creatorId, reason, { session });
-      const affectedReports = await resolvePendingReports({
+      await createAction({
         pollSlug: report.pollSlug,
+        reportId: report._id,
         action: "owner_suspended",
-        actor: actorFrom(request),
+        ...actorFrom(request),
         targetUserId: poll.creatorId,
         note: reason,
         before: pollSnapshot(poll),
         after: pollSnapshot(poll),
-        session,
-      });
-      return { affectedReports };
+      }, session);
     });
-    return response.json({ message: "Poll owner suspended and report resolved", affectedReports: result.affectedReports });
+    return response.json({ message: "Poll owner suspended. Reports remain pending until the content is reviewed." });
   } catch (error) {
     return sendAdminError(error, response, next);
   }
@@ -512,12 +520,11 @@ router.patch("/users/:id/role", requireAdmin, limitWrites, async (request, respo
     if (request.params.id === request.auth.user.id) {
       return response.status(400).json({ message: "Another administrator must change your role" });
     }
-    const currentUser = await findAuthUserById(request.params.id);
-    if (!currentUser) return response.status(404).json({ message: "User not found" });
-    const previousRole = USER_ROLES.includes(currentUser.role) ? currentUser.role : "user";
-    if (previousRole === role) return response.json({ user: serializeUser(currentUser) });
-
     const user = await withDatabaseTransaction(async (session) => {
+      const currentUser = await findAuthUserById(request.params.id, { session });
+      if (!currentUser) throw new UserAdminError("User not found", 404);
+      const previousRole = USER_ROLES.includes(currentUser.role) ? currentUser.role : "user";
+      if (previousRole === role) return currentUser;
       const updated = await setAuthUserRole(request.params.id, role, { session });
       await createAction({
         ...actorFrom(request),

@@ -30,7 +30,7 @@ Set all server variables from `.env.example` in the Vercel project's **Productio
 ## API
 
 - `GET /api/health` — readiness check
-- `/api/auth/*` — Better Auth session, Google OAuth, magic-link, and admin endpoints
+- `/api/auth/*` — Better Auth sign-in/session endpoints; built-in administration and alternative session-management routes are disabled
 - `GET /api/auth-config` — enabled public sign-in methods (never returns credentials)
 - `GET /api/polls?category=Tech&trending=true&page=1&limit=12` — filtered, paginated polls, `hasMore`, and platform statistics
 - `GET /api/polls/:slug` — one poll
@@ -58,7 +58,15 @@ Report decisions, content edits, role changes, suspensions, and reactivations ar
 
 Writes use MongoDB-backed rate limits across Vercel instances. Poll creation is limited per account and IP. Anonymous voting uses a signed HttpOnly first-party cookie and a unique database receipt; it prevents repeat votes from the same browser but remains a casual-poll model because cookies, devices, and networks can be changed.
 
-Run `npm run db:indexes -- --apply` once after deploying schema changes to synchronize production indexes. Run `npm run db:encrypt-oauth -- --apply` once after deploying Better Auth token encryption; both commands are dry-run by default. Better Auth's numeric rate-limit records are pruned opportunistically every hour on a warm API instance, while application rate buckets use a MongoDB TTL index.
+Run `npm run db:indexes` to inspect proposed indexes, then `npm run db:indexes -- --apply` in the intended environment before exposing features that depend on them. `npm run db:indexes -- --verify` checks required keys, uniqueness, partial filters and TTL settings without writing. Never point a test suite at Atlas. Run `npm run db:encrypt-oauth -- --apply` once after deploying Better Auth token encryption; both migration commands are dry-run by default. Better Auth's numeric rate-limit records are pruned opportunistically every hour on a warm API instance, while application rate buckets use a MongoDB TTL index.
+
+## Staff security
+
+Staff must enroll an authenticator from **Account → Account security**, save the recovery codes privately, and verify a code before accessing staff tools. Staff access requires a session created within 12 hours; moderation writes require factor verification within 15 minutes. Google sign-in alone does not meet this requirement. Ordinary login is not itself gated by the authenticator.
+
+Account security lists signed-in devices without exposing session tokens. Revoking other devices and deleting an account require recent authentication (or recent factor verification when enabled). Staff cannot disable their authenticator. Select and test a second recovery administrator before launch; lost-factor recovery and recovery-code regeneration still need an operational workflow.
+
+Suspending a poll owner revokes their sessions but deliberately leaves content reports pending. Staff must separately edit/remove the content or dismiss the report. Reports for content already removed can be resolved with an audit reason.
 
 A poll is trending after at least three votes when its most recent vote was within seven days. Popular qualifying polls rank first, with recent activity breaking ties. Older records without an activity timestamp use their creation time during the transition.
 
@@ -67,4 +75,7 @@ A poll is trending after at least three votes when its most recent vote was with
 ```bash
 npm run lint
 npm test
+npm run test:integration
 ```
+
+Use Node 22. Integration tests download MongoDB 7.0 into a temporary cache and create an isolated local replica set; they never reuse the application's database URI. Tests cover real auth enforcement, transaction rollback, duplicate-vote races, concurrent administrator safeguards, account deletion and index verification. Browser tests live in the frontend repository. See `PRODUCTION-READINESS.md` for outstanding requirements; passing these tests is not a production-readiness certification.

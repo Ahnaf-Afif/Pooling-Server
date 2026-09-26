@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { after, before, test } from "node:test";
+import { startServer, stopServer } from "./helpers/http.js";
 import express from "express";
 import mongoose from "mongoose";
 
@@ -67,21 +68,12 @@ before(async () => {
     next();
   });
   app.use("/api/polls", pollRoutes);
-  let listener;
-  await new Promise((resolve, reject) => {
-    listener = app.listen(0, "127.0.0.1");
-    listener.once("listening", resolve);
-    listener.once("error", reject);
-  });
-  server = listener;
+  server = await startServer(app);
   baseUrl = `http://127.0.0.1:${server.address().port}`;
 });
 
 after(async () => {
-  await new Promise((resolve) => {
-    server.close(resolve);
-    server.closeAllConnections();
-  });
+  await stopServer(server);
   Object.assign(Poll, originalPollMethods);
   mongoose.connection.transaction = originalTransaction;
   RateBucket.findOneAndUpdate = originalRateLimit;

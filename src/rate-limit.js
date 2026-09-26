@@ -69,3 +69,11 @@ export const limitReports = createLimiter({
   message: "Too many reports. Please try again later.",
   keys: (request) => [request.ip || "unknown"],
 });
+
+export const limitSecurityAttempts = createLimiter({
+  prefix: "security",
+  windowMs: 15 * 60 * 1000,
+  max: 10,
+  message: "Too many security attempts. Try again in 15 minutes.",
+  keys: (request) => [`user:${request.auth.user.id}`],
+});
