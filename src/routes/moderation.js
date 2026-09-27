@@ -9,6 +9,7 @@ import Report from "../models/Report.js";
 import RecoveryRequest from "../models/RecoveryRequest.js";
 import AuthUser from "../models/AuthUser.js";
 import { approveRecovery } from "../services/account-recovery.js";
+import { paginateStaff, StaffPaginationError } from "../services/staff-pagination.js";
 import { limitWrites } from "../rate-limit.js";
 import {
   findAuthUserById,
@@ -25,7 +26,6 @@ const router = Router();
 const REPORT_STATUSES = ["pending", "resolved", "dismissed"];
 const MANAGED_REPORT_STATUSES = ["pending", "dismissed"];
 const USER_ROLES = ["user", "moderator", "admin"];
-const MAX_PAGE = 1000;
 
 router.use((_request, response, next) => {
   response.set("Cache-Control", "private, no-store");
@@ -101,11 +101,14 @@ function serializeAction(action) {
     affectedReports: action.affectedReports ?? null,
     previousRole: action.previousRole || null,
     newRole: action.newRole || null,
+    pollSlug: action.pollSlug || null,
+    reportId: action.reportId ? String(action.reportId) : null,
+    targetUserId: action.targetUserId || null,
     createdAt: action.createdAt,
   };
 }
 
-function serializeUser(user, history = []) {
+function serializeUser(user) {
   return {
     id: user.id,
     name: user.name || "Community member",
@@ -116,7 +119,6 @@ function serializeUser(user, history = []) {
     banReason: user.banReason || "",
     banExpires: user.banExpires || null,
     createdAt: user.createdAt,
-    history: history.map(serializeAction),
   };
 }
 
@@ -201,6 +203,7 @@ async function updatePollContent(poll, value, session) {
 }
 
 function sendAdminError(error, response, next) {
+  if (error instanceof StaffPaginationError) return response.status(400).json({ message: error.message });
   if (error?.code === 11000) {
     return response.status(409).json({ message: "A pending report from this reporter already exists. Review that report before reopening this one." });
   }
@@ -258,11 +261,7 @@ router.get("/polls/:slug", async (request, response, next) => {
   try {
     const poll = await Poll.findOne({ slug: request.params.slug, deletedAt: null });
     if (!poll) return response.status(404).json({ message: "Poll not found" });
-    const history = await ModerationAction.find({
-      pollSlug: poll.slug,
-      action: "poll_edited",
-    }).sort({ createdAt: -1 }).limit(50).lean();
-    return response.json({ poll: serializePoll(poll), history: history.map(serializeAction) });
+    return response.json({ poll: serializePoll(poll) });
   } catch (error) {
     return next(error);
   }
@@ -306,35 +305,17 @@ router.patch("/polls/:slug", limitWrites, async (request, response, next) => {
 router.get("/reports", async (request, response, next) => {
   try {
     const status = REPORT_STATUSES.includes(request.query.status) ? request.query.status : "pending";
-    const page = Number(request.query.page || 1);
-    if (!Number.isSafeInteger(page) || page < 1 || page > MAX_PAGE) {
-      return response.status(400).json({ message: `Page must be between 1 and ${MAX_PAGE}` });
-    }
-    const limit = 25;
-    const [reports, total] = await Promise.all([
-      Report.find({ status }).sort({ createdAt: -1, _id: -1 }).skip((page - 1) * limit).limit(limit).lean(),
-      Report.countDocuments({ status }),
-    ]);
+    const { items: reports, nextCursor } = await paginateStaff(Report, {
+      query: request.query, filter: { status }, scope: `reports:${status}`,
+      select: "pollSlug reason details status createdAt",
+    });
     const pollSlugs = [...new Set(reports.map((report) => report.pollSlug))];
-    const reportIds = reports.map((report) => report._id);
-    const [polls, actions] = await Promise.all([
-      pollSlugs.length ? Poll.find({ slug: { $in: pollSlugs } }).lean() : [],
-      reportIds.length
-        ? ModerationAction.find({ reportId: { $in: reportIds } }).sort({ createdAt: 1 }).lean()
-        : [],
-    ]);
+    const polls = pollSlugs.length ? await Poll.find({ slug: { $in: pollSlugs } }).maxTimeMS(5000).lean() : [];
     const pollsBySlug = new Map(polls.map((poll) => [poll.slug, poll]));
-    const actionsByReport = new Map();
-    for (const action of actions) {
-      const key = String(action.reportId);
-      actionsByReport.set(key, [...(actionsByReport.get(key) || []), serializeAction(action)]);
-    }
 
     return response.json({
       role: request.auth.effectiveRole,
-      total,
-      page,
-      pages: Math.max(1, Math.ceil(total / limit)),
+      nextCursor,
       reports: reports.map((report) => {
         const poll = pollsBySlug.get(report.pollSlug);
         return {
@@ -344,15 +325,35 @@ router.get("/reports", async (request, response, next) => {
           details: report.details,
           status: report.status,
           createdAt: report.createdAt,
-          history: actionsByReport.get(String(report._id)) || [],
           poll: poll ? serializePoll(poll) : null,
         };
       }),
     });
   } catch (error) {
-    return next(error);
+    return sendAdminError(error, response, next);
   }
 });
+
+function historyHandler(filterFrom, scopeFrom) {
+  return async (request, response, next) => {
+    try {
+      const result = await paginateStaff(ModerationAction, {
+        query: request.query, filter: filterFrom(request), scope: scopeFrom(request),
+      });
+      return response.json({ actions: result.items.map(serializeAction), nextCursor: result.nextCursor });
+    } catch (error) { return sendAdminError(error, response, next); }
+  };
+}
+
+// Histories intentionally survive soft removal or deletion of their subject.
+// The global administrator log also exposes retained, anonymized old actions.
+router.get("/history", requireAdmin, historyHandler(() => ({}), () => "history:all"));
+router.get("/reports/:id/history", historyHandler((request) => {
+  if (!mongoose.isValidObjectId(request.params.id)) throw new ModerationRequestError("Invalid report");
+  return { reportId: request.params.id };
+}, (request) => `history:report:${request.params.id}`));
+router.get("/polls/:slug/history", historyHandler((request) => ({ pollSlug: request.params.slug }), (request) => `history:poll:${request.params.slug}`));
+router.get("/users/:id/history", requireAdmin, historyHandler((request) => ({ targetUserId: request.params.id }), (request) => `history:user:${request.params.id}`));
 
 router.patch("/reports/:id", limitWrites, async (request, response, next) => {
   try {
@@ -512,30 +513,13 @@ router.post("/reports/:id/suspend-owner", requireAdmin, limitWrites, async (requ
 
 router.get("/users", requireAdmin, async (request, response, next) => {
   try {
-    const page = Number(request.query.page || 1);
     const searchField = request.query.field === "email" ? "email" : "name";
     const searchValue = typeof request.query.q === "string" ? request.query.q.trim().slice(0, 160) : "";
-    if (!Number.isSafeInteger(page) || page < 1 || page > MAX_PAGE) {
-      return response.status(400).json({ message: `Page must be between 1 and ${MAX_PAGE}` });
-    }
-    const limit = 20;
-    const result = await listAuthUsers({ page, limit, searchField, searchValue });
-    const userIds = result.users.map((user) => user.id);
-    const actions = userIds.length
-      ? await ModerationAction.find({ targetUserId: { $in: userIds } }).sort({ createdAt: -1 }).limit(200).lean()
-      : [];
-    const historyByUser = new Map();
-    for (const action of actions) {
-      const history = historyByUser.get(action.targetUserId) || [];
-      if (history.length < 5) history.push(action);
-      historyByUser.set(action.targetUserId, history);
-    }
+    const result = await listAuthUsers({ query: request.query, searchField, searchValue });
 
     return response.json({
-      users: result.users.map((user) => serializeUser(user, historyByUser.get(user.id) || [])),
-      total: result.total,
-      page,
-      pages: Math.max(1, Math.ceil(result.total / limit)),
+      users: result.users.map((user) => serializeUser(user)),
+      nextCursor: result.nextCursor,
       selfId: request.auth.user.id,
     });
   } catch (error) {

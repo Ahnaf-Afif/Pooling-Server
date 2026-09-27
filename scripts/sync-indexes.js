@@ -11,7 +11,7 @@ import PlatformStats from "../src/models/PlatformStats.js";
 import RecoveryRequest from "../src/models/RecoveryRequest.js";
 
 const models = [Poll, VoteReceipt, Report, ModerationAction, RateBucket, AdminGuard, PlatformStats, RecoveryRequest];
-const migrationId = "2026-09-account-recovery-v5";
+const migrationId = "2026-09-staff-history-v6";
 
 const nativeIndexes = {
   user: [

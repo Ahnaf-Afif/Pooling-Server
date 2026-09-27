@@ -48,7 +48,11 @@ Set all server variables from `.env.example` in the Vercel project's **Productio
 - `GET /api/polls/:slug/my-vote` — private current-account/guest receipt lookup; establishes a signed guest cookie before voting
 - `POST /api/polls/:slug/votes` — record one vote per signed browser or account; identical retries return success without recounting
 - `POST /api/polls/:slug/reports` — submit a rate-limited public report
-- `GET /api/moderation/reports` — role-protected report queue with internal action history
+- `GET /api/moderation/reports` — role-protected, cursor-paginated report queue
+- `GET /api/moderation/reports/:id/history` — full retained report history, cursor-paginated
+- `GET /api/moderation/polls/:slug/history` — full retained poll history, including removed polls
+- `GET /api/moderation/users/:id/history` — administrator-only account action history
+- `GET /api/moderation/history` — administrator-only retained audit log, including anonymized actions
 - `GET/PATCH /api/moderation/polls/:slug` — load or edit any poll with a required audit reason
 - `POST /api/moderation/reports/:id/notes` — add a private moderation note
 - `PATCH /api/moderation/reports/:id/poll` — edit reported content and resolve the report
@@ -68,8 +72,29 @@ Public and owned poll lists use opaque `nextCursor` values. Pass the returned
 cursor as `cursor` with the same filters to load the next page; a null cursor
 means the end. Public limits are 1–100 (default 50); owner limits are 1–50
 (default 24). Changed filters or accounts require restarting without a cursor.
-Numbered pages after page one are rejected. Moderation lists still use numbered
-pages and their existing caps; these require separate migration.
+Numbered pages after page one are rejected.
+
+### Staff lists and audit history
+
+Reports and user lists also use `nextCursor`/`cursor`, with no fixed last-page
+cutoff. Defaults are 25 reports and 20 users per page; `limit` accepts 1–50.
+User search keeps `q` and `field` unchanged across pages. Cursors are bound to
+the list and its filters; reset them when changing report status or search.
+These lists do not return expensive exact totals or embed history arrays.
+
+History endpoints return `{ actions, nextCursor }` with 25 actions by default
+(maximum 50). All retained records can be traversed newest first with an
+immutable ID tie-breaker. Before/after snapshots remain available. History is
+loaded on demand in the UI instead of inflating every queue response. Refresh
+to see newly added actions; status changes/deletion can remove rows between
+requests. This is live pagination, not an immutable exported snapshot.
+
+Account IDs retain their BSON string/ObjectId type across cursor boundaries.
+Private response caching is disabled. Moderators can read report/poll history;
+account history and the global log require an administrator. Audit subjects may
+be removed without hiding their retained records from the global log. Account
+deletion still anonymizes links according to the account-deletion workflow.
+Append-only external retention and final retention policy remain separate work.
 
 Public statistics are global, not category-specific. They refresh at most once
 per minute through a shared database lease, and only accompany the first page
@@ -85,7 +110,7 @@ a poll before a previous cursor, so refresh to see the current ordering.
 **Release compatibility:** deploy the matching frontend and backend together
 behind a verified release process. An older frontend's `page=2` requests will
 fail against this API; an older backend does not provide the new cursors. Apply
-and verify migration `2026-09-poll-cursors-v4` before promotion, and preserve the
+and verify migration `2026-09-staff-history-v6` before promotion, and preserve the
 VOTER_SECRET prerequisite documented in SECRET-ROTATION.md. No production
 migration or deployment is implied by the local tests.
 
@@ -109,7 +134,7 @@ Staff must enroll an authenticator from **Account → Account security**, save t
 
 Account security lists signed-in devices without exposing session tokens. Revoking other devices and deleting an account require recent authentication (or recent factor verification when enabled). Staff cannot disable their authenticator. Recovery codes can be replaced after verification, invalidating old codes and revoking other sessions. Lost-factor recovery requires a fresh sign-in and independent approval by another MFA-verified administrator; it is transactional and audited. See [STAFF-RECOVERY.md](STAFF-RECOVERY.md). Select and test a second recovery administrator before launch. Recovery notifications are currently manual.
 
-The recovery release additionally requires index migration `2026-09-account-recovery-v5`; it includes all previously declared indexes. Request records expire after 24 hours. Apply and verify indexes before promoting this backend and its matching account/admin UI.
+The current index migration includes the recovery indexes introduced in `2026-09-account-recovery-v5`. Request records expire after 24 hours. Apply and verify indexes before promoting this backend and its matching account/admin UI.
 
 Suspending a poll owner revokes their sessions but deliberately leaves content reports pending. Staff must separately edit/remove the content or dismiss the report. Reports for content already removed can be resolved with an audit reason.
 

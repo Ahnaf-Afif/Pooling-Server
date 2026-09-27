@@ -48,6 +48,8 @@ function queryResult(value) {
     sort() { return this; },
     skip() { return this; },
     limit() { return this; },
+    select() { return this; },
+    maxTimeMS() { return this; },
     session() { return this; },
     lean() { return Promise.resolve(value); },
     toArray() { return Promise.resolve(value); },
@@ -202,8 +204,8 @@ test("keeps reporter identity private and paginates the moderation queue", async
   assert.equal(data.reports[0].reporterKey, undefined);
   assert.equal(data.reports[0].reporterUserId, undefined);
   assert.equal(data.reports[0].poll.options[0].votes, 3);
-  assert.equal(data.page, 1);
-  assert.equal(data.pages, 1);
+  assert.equal(data.nextCursor, null);
+  assert.equal(data.reports[0].history, undefined);
 });
 
 test("does not resolve a report without a content decision", async () => {

@@ -32,5 +32,6 @@ reportSchema.index(
   },
 );
 reportSchema.index({ status: 1, createdAt: -1 });
+reportSchema.index({ status: 1, createdAt: -1, _id: -1 });
 
 export default mongoose.model("Report", reportSchema);

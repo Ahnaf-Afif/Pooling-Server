@@ -38,5 +38,9 @@ const moderationActionSchema = new mongoose.Schema(
 
 moderationActionSchema.index({ reportId: 1, createdAt: 1 });
 moderationActionSchema.index({ targetUserId: 1, createdAt: -1 });
+moderationActionSchema.index({ createdAt: -1, _id: -1 });
+moderationActionSchema.index({ reportId: 1, createdAt: -1, _id: -1 });
+moderationActionSchema.index({ pollSlug: 1, createdAt: -1, _id: -1 });
+moderationActionSchema.index({ targetUserId: 1, createdAt: -1, _id: -1 });
 
 export default mongoose.model("ModerationAction", moderationActionSchema);

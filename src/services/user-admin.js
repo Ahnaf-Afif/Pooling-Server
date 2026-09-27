@@ -3,6 +3,7 @@ import { ObjectId } from "mongodb";
 import AuthSession from "../models/AuthSession.js";
 import AuthUser from "../models/AuthUser.js";
 import AdminGuard from "../models/AdminGuard.js";
+import { paginateStaff } from "./staff-pagination.js";
 
 const ADMIN_ROLE = /(^|,)admin(,|$)/;
 
@@ -33,15 +34,15 @@ export function serializeAuthUser(user) {
   return { ...user, id: String(user._id), _id: undefined };
 }
 
-export async function listAuthUsers({ page, limit, searchField, searchValue }) {
+export async function listAuthUsers({ query, searchField, searchValue }) {
   const filter = searchValue
     ? { [searchField]: { $regex: escapeRegex(searchValue), $options: "i" } }
     : {};
-  const [users, total] = await Promise.all([
-    AuthUser.find(filter).sort({ createdAt: -1, _id: -1 }).skip((page - 1) * limit).limit(limit).lean(),
-    AuthUser.countDocuments(filter),
-  ]);
-  return { users: users.map(serializeAuthUser), total };
+  const result = await paginateStaff(AuthUser, {
+    query, filter, scope: JSON.stringify(["users", searchField, searchValue]), limit: 20,
+    select: "name email emailVerified role banned banReason banExpires createdAt",
+  });
+  return { users: result.items.map(serializeAuthUser), nextCursor: result.nextCursor };
 }
 
 export async function findAuthUserById(userId, { session } = {}) {

@@ -762,3 +762,139 @@ test("account export omits recovery fingerprints and deletion clears recovery ow
   assert.equal(await database.collection("recoveryrequests").findOne({ _id: user.id }), null);
   assert.equal((await database.collection("recoveryrequests").findOne({ _id: "another-owner" })).approvedBy, null);
 });
+
+async function staffGet(path, user) {
+  return fetch(`${baseUrl}/api/moderation${path}`, { headers: { Cookie: user.cookie } });
+}
+
+test("report cursors reach every older report without exposing identity or embedding unbounded history", async () => {
+  const staff = await createUser("moderator");
+  await enrollFactor(staff);
+  const poll = await createPoll();
+  const reports = await Report.insertMany(Array.from({ length: 61 }, (_, index) => ({
+    pollSlug: poll.slug, reporterKey: `private-${index}`, reporterUserId: `private-user-${index}`, reason: "spam",
+    createdAt: new Date("2026-01-01T00:00:00Z"),
+  })));
+  const firstResponse = await staffGet("/reports?status=pending", staff);
+  assert.equal(firstResponse.headers.get("cache-control"), "private, no-store");
+  const first = await firstResponse.json();
+  assert.equal(first.reports.length, 25);
+  assert.ok(first.reports.every((report) => !report.reporterKey && !report.reporterUserId && !report.history));
+  const seen = first.reports.map((report) => report.id);
+  await Report.create({ pollSlug: poll.slug, reporterKey: "new-arrival", reason: "other" });
+  let cursor = first.nextCursor;
+  while (cursor) {
+    const response = await staffGet(`/reports?status=pending&cursor=${cursor}`, staff);
+    assert.equal(response.status, 200, await response.clone().text());
+    const data = await response.json();
+    seen.push(...data.reports.map((report) => report.id));
+    cursor = data.nextCursor;
+  }
+  assert.equal(new Set(seen).size, reports.length);
+  assert.deepEqual(seen, reports.map((report) => String(report._id)).reverse());
+  assert.equal((await staffGet(`/reports?status=resolved&cursor=${first.nextCursor}`, staff)).status, 400);
+  assert.equal((await staffGet("/reports?page=1001", staff)).status, 400);
+  assert.equal((await staffGet("/reports?limit=100000", staff)).status, 400);
+  assert.equal((await staffGet("/reports?cursor=invalid", staff)).status, 400);
+  const forged = JSON.parse(Buffer.from(first.nextCursor, "base64url").toString("utf8"));
+  forged.type = "string";
+  forged.id = "not-an-object-id";
+  const token = Buffer.from(JSON.stringify(forged)).toString("base64url");
+  assert.equal((await staffGet(`/reports?cursor=${token}`, staff)).status, 400);
+});
+
+test("account cursors preserve tied timestamps and mixed string/ObjectId IDs and bind to search filters", async () => {
+  const administrator = await createUser("admin");
+  await enrollFactor(administrator);
+  const users = Array.from({ length: 61 }, (_, index) => {
+    const id = new ObjectId();
+    return { _id: index % 2 ? id : String(id), name: `Cursor member ${index}`, email: `cursor-${index}@example.test`,
+      emailVerified: true, role: "user", image: "private-image", createdAt: new Date("2026-01-01T00:00:00Z") };
+  });
+  await database.collection("user").insertMany(users);
+  const expected = await database.collection("user").find({ name: /^Cursor member/ }).sort({ createdAt: -1, _id: -1 }).toArray();
+  let cursor, firstCursor;
+  const seen = [];
+  do {
+    const response = await staffGet(`/users?field=name&q=Cursor%20member&limit=7${cursor ? `&cursor=${cursor}` : ""}`, administrator);
+    assert.equal(response.status, 200, await response.clone().text());
+    const data = await response.json();
+    assert.ok(data.users.every((user) => !user.image && !user.history));
+    seen.push(...data.users.map((user) => user.id));
+    firstCursor ||= data.nextCursor;
+    cursor = data.nextCursor;
+  } while (cursor);
+  assert.deepEqual(seen, expected.map((user) => String(user._id)));
+  assert.equal(new Set(seen).size, users.length);
+  assert.equal((await staffGet(`/users?q=different&cursor=${firstCursor}`, administrator)).status, 400);
+});
+
+test("complete report, poll and account histories remain accessible beyond old caps with scoped permissions", async () => {
+  const administrator = await createUser("admin");
+  await enrollFactor(administrator);
+  const moderator = await createUser("moderator");
+  await enrollFactor(moderator);
+  const member = await createUser();
+  const poll = await createPoll(member.id);
+  const report = await Report.create({ pollSlug: poll.slug, reporterKey: "private-reporter", reason: "spam" });
+  const actions = await ModerationAction.insertMany(Array.from({ length: 257 }, (_, index) => ({
+    action: "poll_edited", actorId: moderator.id, actorName: "Reviewing moderator", actorRole: "moderator",
+    pollSlug: poll.slug, reportId: report._id, targetUserId: member.id, note: `Audit entry ${index}`,
+    before: { category: "Tech" }, after: { category: "Social" }, createdAt: new Date("2026-01-01T00:00:00Z"),
+  })));
+  // Removing the subject must not make its retained audit history unreachable.
+  await Poll.updateOne({ _id: poll._id }, { $set: { deletedAt: new Date(), status: "archived" } });
+  for (const path of [`/reports/${report._id}/history`, `/polls/${poll.slug}/history`, `/users/${member.id}/history`, "/history"]) {
+    const identity = path.startsWith("/users") || path === "/history" ? administrator : moderator;
+    const ids = [];
+    let cursor;
+    do {
+      const response = await staffGet(`${path}?limit=50${cursor ? `&cursor=${cursor}` : ""}`, identity);
+      assert.equal(response.status, 200, await response.clone().text());
+      assert.equal(response.headers.get("cache-control"), "private, no-store");
+      const data = await response.json();
+      ids.push(...data.actions.map((entry) => entry.id));
+      assert.ok(data.actions.every((entry) => entry.before.category === "Tech" && entry.after.category === "Social"));
+      cursor = data.nextCursor;
+    } while (cursor);
+    assert.deepEqual(ids, actions.map((action) => String(action._id)).reverse());
+  }
+  assert.equal((await staffGet("/history", moderator)).status, 403);
+  assert.equal((await staffGet(`/users/${member.id}/history`, moderator)).status, 403);
+  assert.equal((await staffGet(`/polls/${poll.slug}/history`, member)).status, 403);
+  assert.equal((await fetch(`${baseUrl}/api/moderation/history`)).status, 403);
+  const page = await (await staffGet(`/reports/${report._id}/history`, moderator)).json();
+  assert.equal((await staffGet(`/polls/${poll.slug}/history?cursor=${page.nextCursor}`, moderator)).status, 400);
+});
+
+test("staff cursor queries seek ordered indexes instead of scanning earlier pages", async () => {
+  const { paginateStaff } = await import("../src/services/staff-pagination.js");
+  const { default: AuthUser } = await import("../src/models/AuthUser.js");
+  const now = Date.now();
+  const reportId = new ObjectId();
+  await Report.insertMany(Array.from({ length: 1000 }, (_, index) => ({
+    pollSlug: "local-query-plan", reporterKey: `local-${index}`, reason: "spam", createdAt: new Date(now - index * 1000),
+  })));
+  await ModerationAction.insertMany(Array.from({ length: 1000 }, (_, index) => ({
+    action: "note_added", actorId: "local-staff", actorName: "Local staff", actorRole: "moderator",
+    pollSlug: "local-query-plan", reportId, targetUserId: "local-user", createdAt: new Date(now - index * 1000),
+  })));
+  await database.collection("user").insertMany(Array.from({ length: 1000 }, (_, index) => ({
+    name: "Local query plan", email: `plan-${index}@example.test`, createdAt: new Date(now - index * 1000),
+  })));
+  for (const [model, filter] of [[Report, { status: "pending" }], [AuthUser, {}], [ModerationAction, {}], [ModerationAction, { reportId }], [ModerationAction, { pollSlug: "local-query-plan" }], [ModerationAction, { targetUserId: "local-user" }]]) {
+    const first = await paginateStaff(model, { query: { limit: "50" }, filter, scope: "query-plan" });
+    const originalFind = model.find;
+    let query;
+    model.find = function (...args) { query = originalFind.apply(this, args); return query; };
+    try {
+      await paginateStaff(model, { query: { cursor: first.nextCursor, limit: "10" }, filter, scope: "query-plan" });
+    } finally { model.find = originalFind; }
+    const explanation = await query.clone().explain("executionStats");
+    const plan = JSON.stringify(explanation.queryPlanner.winningPlan);
+    assert.match(plan, /IXSCAN/);
+    assert.doesNotMatch(plan, /"stage":"SORT"/);
+    assert.equal(explanation.executionStats.nReturned, 11);
+    assert.ok(explanation.executionStats.totalDocsExamined <= 40, `${model.modelName} examined ${explanation.executionStats.totalDocsExamined} documents`);
+  }
+});
