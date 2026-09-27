@@ -45,7 +45,8 @@ Set all server variables from `.env.example` in the Vercel project's **Productio
 - `POST /api/polls/:slug/close` — stop new votes
 - `POST /api/polls/:slug/archive` — remove an owned poll from listings
 - `DELETE /api/polls/:slug` — soft-delete an owned poll
-- `POST /api/polls/:slug/votes` — record one vote per signed browser or account
+- `GET /api/polls/:slug/my-vote` — private current-account/guest receipt lookup; establishes a signed guest cookie before voting
+- `POST /api/polls/:slug/votes` — record one vote per signed browser or account; identical retries return success without recounting
 - `POST /api/polls/:slug/reports` — submit a rate-limited public report
 - `GET /api/moderation/reports` — role-protected report queue with internal action history
 - `GET/PATCH /api/moderation/polls/:slug` — load or edit any poll with a required audit reason
@@ -89,6 +90,16 @@ VOTER_SECRET prerequisite documented in SECRET-ROTATION.md. No production
 migration or deployment is implied by the local tests.
 
 Writes use MongoDB-backed rate limits across Vercel instances. Poll creation is limited per account and IP. Anonymous voting uses a signed HttpOnly first-party cookie and a unique database receipt; it prevents repeat votes from the same browser but remains a casual-poll model because cookies, devices, and networks can be changed.
+
+Voting clients should load `my-vote` and preserve its cookie before the first
+submission. Its response contains only `optionId` (or null), uses `private,
+no-store`, and does not accept a caller-supplied account ID. A signed-in request
+reads only that account's receipt, not a previous guest's choice on the device.
+`POST /votes` returns `{ poll, replayed }`; retrying the same choice returns
+`replayed: true` without changing totals or activity timestamps, even if the poll
+has since closed. A different choice returns 409; deleted polls return 404.
+Guests who discard cookies and anonymous-to-account duplicate identities remain
+limitations pending reconciliation. This does not claim one-human/one-vote.
 
 Run `npm run db:indexes` to inspect proposed indexes, then `npm run db:indexes -- --apply` in the intended environment before exposing features that depend on them. `npm run db:indexes -- --verify` checks required keys, uniqueness, partial filters and TTL settings without writing. Never point a test suite at Atlas. Run `npm run db:encrypt-oauth -- --apply` once after deploying Better Auth token encryption; both migration commands are dry-run by default. Better Auth's numeric rate-limit records are pruned opportunistically every hour on a warm API instance, while application rate buckets use a MongoDB TTL index.
 

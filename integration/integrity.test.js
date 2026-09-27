@@ -138,8 +138,10 @@ test("concurrent duplicate votes create exactly one receipt and one count", asyn
   const user = await createUser();
   const poll = await createPoll();
   const responses = await Promise.all(Array.from({ length: 8 }, () => post(`/api/polls/${poll.slug}/votes`, user.cookie, { optionId: String(poll.options[0]._id) })));
-  assert.equal(responses.filter((response) => response.status === 200).length, 1);
-  assert.equal(responses.filter((response) => response.status === 409).length, 7);
+  assert.equal(responses.filter((response) => response.status === 200).length, 8);
+  const results = await Promise.all(responses.map((response) => response.json()));
+  assert.equal(results.filter((result) => result.replayed === false).length, 1);
+  assert.equal(results.filter((result) => result.replayed === true).length, 7);
   assert.equal(await VoteReceipt.countDocuments({ pollSlug: poll.slug }), 1);
   const saved = await Poll.findById(poll._id);
   assert.equal(saved.totalVotes, 1);
@@ -293,7 +295,9 @@ test("auth secret rotation preserves duplicate protection, export and deletion o
   const original = process.env.BETTER_AUTH_SECRET;
   try {
     process.env.BETTER_AUTH_SECRET = "rotated-auth-signing-key-test-only-0123456789";
-    assert.equal((await post(path, user.cookie, body)).status, 409);
+    const retried = await post(path, user.cookie, { optionId: body.optionId.toUpperCase() });
+    assert.equal(retried.status, 200);
+    assert.equal((await retried.json()).replayed, true);
     assert.equal((await Poll.findById(poll._id)).totalVotes, 1);
     const exported = await fetch(`${baseUrl}/api/account/export`, { headers: { Cookie: user.cookie } });
     assert.equal(exported.status, 200);
@@ -506,4 +510,69 @@ test("account export requires recent sign-in or session-scoped MFA verification"
   const signed = `${otherSession.token}.${await makeSignature(otherSession.token, secret)}`;
   const otherDevice = await fetch(`${baseUrl}/api/account/export`, { headers: { Cookie: `better-auth.session_token=${encodeURIComponent(signed)}` } });
   assert.equal(otherDevice.status, 403, "verification must not carry over to another device");
+});
+
+test("private vote lookup is scoped to the account or signed guest cookie", async () => {
+  const owner = await createUser();
+  const other = await createUser();
+  const poll = await createPoll();
+  const path = `/api/polls/${poll.slug}`;
+  const optionId = String(poll.options[0]._id);
+  assert.equal((await post(`${path}/votes`, owner.cookie, { optionId })).status, 200);
+  const lookup = (cookie = "", query = "") => fetch(`${baseUrl}${path}/my-vote${query}`, { headers: { Cookie: cookie } });
+  const own = await lookup(owner.cookie);
+  assert.equal(own.headers.get("cache-control"), "private, no-store");
+  assert.match(own.headers.get("vary"), /Cookie/);
+  assert.deepEqual(await own.json(), { optionId });
+  assert.deepEqual(await (await lookup(other.cookie, `?userId=${owner.id}`)).json(), { optionId: null });
+
+  const guest = await lookup();
+  const cookieHeader = guest.headers.get("set-cookie");
+  assert.match(cookieHeader, /HttpOnly/);
+  assert.match(cookieHeader, /SameSite=Lax/);
+  assert.deepEqual(await guest.json(), { optionId: null });
+  const guestCookie = cookieHeader.split(";", 1)[0];
+  const guestOption = String(poll.options[1]._id);
+  const requests = await Promise.all(Array.from({ length: 4 }, () => post(`${path}/votes`, guestCookie, { optionId: guestOption })));
+  assert.ok(requests.every((response) => response.status === 200));
+  assert.deepEqual(await (await lookup(guestCookie)).json(), { optionId: guestOption });
+  assert.deepEqual(await (await lookup()).json(), { optionId: null });
+  assert.deepEqual(await (await lookup(owner.cookie)).json(), { optionId });
+  assert.equal((await Poll.findById(poll._id)).totalVotes, 2);
+  await Poll.updateOne({ _id: poll._id }, { $set: { deletedAt: new Date() } });
+  assert.equal((await lookup(owner.cookie)).status, 404);
+});
+
+test("same-choice retries survive closure but cannot change a vote or reveal removed polls", async () => {
+  const user = await createUser();
+  const poll = await createPoll();
+  const path = `/api/polls/${poll.slug}/votes`;
+  const body = { optionId: String(poll.options[0]._id) };
+  const first = await post(path, user.cookie, body);
+  assert.equal(first.status, 200);
+  const saved = await Poll.findById(poll._id).lean();
+  for (const status of ["active", "closed", "archived"]) {
+    await Poll.updateOne({ _id: poll._id }, { $set: { status } });
+    const retried = await post(path, user.cookie, body);
+    assert.equal(retried.status, 200);
+    assert.equal((await retried.json()).replayed, true);
+  }
+  assert.equal((await post(path, user.cookie, { optionId: String(poll.options[1]._id) })).status, 409);
+  const result = await Poll.findById(poll._id);
+  assert.equal(result.totalVotes, 1);
+  assert.equal(result.lastVotedAt.getTime(), saved.lastVotedAt.getTime());
+  assert.equal(await VoteReceipt.countDocuments({ pollSlug: poll.slug }), 1);
+  await Poll.updateOne({ _id: poll._id }, { $set: { deletedAt: new Date() } });
+  assert.equal((await post(path, user.cookie, body)).status, 404);
+});
+
+test("simultaneous conflicting choices accept only one immutable vote", async () => {
+  const user = await createUser();
+  const poll = await createPoll();
+  const responses = await Promise.all(poll.options.map((option) => post(`/api/polls/${poll.slug}/votes`, user.cookie, { optionId: String(option._id) })));
+  assert.deepEqual(responses.map((response) => response.status).sort(), [200, 409]);
+  const saved = await Poll.findById(poll._id);
+  assert.equal(saved.totalVotes, 1);
+  assert.equal(saved.options.reduce((sum, option) => sum + option.votes, 0), 1);
+  assert.equal(await VoteReceipt.countDocuments({ pollSlug: poll.slug }), 1);
 });

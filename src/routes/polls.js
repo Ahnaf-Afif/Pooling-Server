@@ -3,7 +3,6 @@ import mongoose from "mongoose";
 
 import { readOptionalSession, requireVerifiedUser } from "../auth-middleware.js";
 import { CATEGORIES, TRENDING_MIN_VOTES, TRENDING_WINDOW_MS } from "../constants.js";
-import { withDatabaseTransaction } from "../db.js";
 import Poll from "../models/Poll.js";
 import Report from "../models/Report.js";
 import VoteReceipt from "../models/VoteReceipt.js";
@@ -12,18 +11,11 @@ import { createSlug, validatePoll } from "../validation.js";
 import { getVoterKey } from "../voter.js";
 import { paginatePolls, PaginationError } from "../services/poll-pagination.js";
 import { getPlatformStats } from "../services/platform-stats.js";
+import { recordVote, VoteError } from "../services/voting.js";
 
 const router = Router();
 const notDeleted = { deletedAt: null };
 const activeStatus = { $in: ["active", null] };
-
-class VoteRejectedError extends Error {
-  constructor(message, status) {
-    super(message);
-    this.name = "VoteRejectedError";
-    this.status = status;
-  }
-}
 
 function ownerFilter(request) {
   return {
@@ -229,7 +221,22 @@ router.post("/:slug/reports", limitReports, async (request, response, next) => {
   }
 });
 
+router.get("/:slug/my-vote", async (request, response, next) => {
+  response.set("Cache-Control", "private, no-store");
+  response.vary("Cookie");
+  try {
+    if (!await Poll.exists({ slug: request.params.slug, ...notDeleted })) return response.status(404).json({ message: "Poll not found" });
+    const session = await readOptionalSession(request);
+    // Establish the guest's signed cookie before their first submission so a
+    // lost vote response can be retried with the same server-recognized identity.
+    const voterKey = getVoterKey(request, response, session);
+    const vote = await VoteReceipt.findOne({ pollSlug: request.params.slug, voterKey }).select("optionId -_id").lean();
+    return response.json({ optionId: vote ? String(vote.optionId) : null });
+  } catch (error) { return next(error); }
+});
+
 router.post("/:slug/votes", limitWrites, async (request, response, next) => {
+  response.set("Cache-Control", "private, no-store");
   try {
     const optionId = request.body?.optionId;
     if (typeof optionId !== "string" || !mongoose.isValidObjectId(optionId)) {
@@ -238,40 +245,9 @@ router.post("/:slug/votes", limitWrites, async (request, response, next) => {
 
     const session = await readOptionalSession(request);
     const voterKey = getVoterKey(request, response, session);
-    const poll = await withDatabaseTransaction(async (databaseSession) => {
-      await VoteReceipt.create([{
-        pollSlug: request.params.slug,
-        voterKey,
-        optionId,
-      }], { session: databaseSession });
-
-      const updatedPoll = await Poll.findOneAndUpdate(
-        {
-          slug: request.params.slug,
-          "options._id": optionId,
-          ...notDeleted,
-          status: activeStatus,
-        },
-        { $inc: { "options.$.votes": 1, totalVotes: 1 }, $set: { lastVotedAt: new Date() } },
-        { returnDocument: "after", runValidators: true, session: databaseSession },
-      );
-      if (updatedPoll) return updatedPoll;
-
-      const existingQuery = Poll.exists({ slug: request.params.slug, ...notDeleted });
-      const existing = typeof existingQuery.session === "function"
-        ? await existingQuery.session(databaseSession)
-        : await existingQuery;
-      throw new VoteRejectedError(
-        existing ? "This poll is closed or the option no longer exists" : "Poll not found",
-        existing ? 409 : 404,
-      );
-    });
-    return response.json({ poll });
+    return response.json(await recordVote({ pollSlug: request.params.slug, voterKey, optionId: optionId.toLowerCase() }));
   } catch (error) {
-    if (error?.code === 11000) {
-      return response.status(409).json({ message: "You have already voted in this poll" });
-    }
-    if (error instanceof VoteRejectedError) {
+    if (error instanceof VoteError) {
       return response.status(error.status).json({ message: error.message });
     }
     return next(error);

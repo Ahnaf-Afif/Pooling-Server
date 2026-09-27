@@ -28,6 +28,7 @@ const originalStats = {
 };
 const originalRateLimit = RateBucket.findOneAndUpdate;
 const originalVoteReceiptMethods = {
+  findOne: VoteReceipt.findOne,
   create: VoteReceipt.create,
   deleteOne: VoteReceipt.deleteOne,
 };
@@ -67,6 +68,7 @@ before(async () => {
   RateBucket.findOneAndUpdate = async () => ({ count: 1 });
   mongoose.connection.transaction = async (work) => work({ testSession: true });
   VoteReceipt.create = async (data) => [{ _id: "receipt-id", ...data[0] }];
+  VoteReceipt.findOne = () => ({ session() { return this; }, lean: async () => null });
   VoteReceipt.deleteOne = async () => ({ deletedCount: 1 });
 
   const app = express();
