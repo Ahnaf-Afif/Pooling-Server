@@ -168,9 +168,88 @@ test("deleting the last administrator is rejected without deleting anything", as
 
 test("concurrent demotions cannot remove every administrator", async () => {
   const admins = await Promise.all([createUser("admin"), createUser("admin")]);
+  for (const admin of admins) await enrollFactor(admin);
   const results = await Promise.allSettled(admins.map((admin) => withDatabaseTransaction((session) => setAuthUserRole(admin.id, "user", { session }))));
   assert.equal(results.filter((result) => result.status === "fulfilled").length, 1);
   assert.equal(await database.collection("user").countDocuments({ role: "admin" }), 1);
+});
+
+test("an unusable backup administrator cannot authorize deletion, demotion or suspension", async () => {
+  const { suspendAuthUser } = await import("../src/services/user-admin.js");
+  const admin = await createUser("admin");
+  await enrollFactor(admin);
+  const backup = await createUser("admin");
+  await enrollFactor(backup);
+  const factor = await database.collection("twoFactor").findOne({ userId: { $in: [backup.id, backup._id] } });
+  const poll = await createPoll(admin.id);
+  for (const state of ["unverified", "unenrolled", "banned", "wrong-role", "missing-factor", "empty-factor"]) {
+    await database.collection("user").updateOne({ _id: backup._id }, { $set: {
+      role: state === "wrong-role" ? "moderator" : "admin", emailVerified: state !== "unverified",
+      banned: state === "banned", twoFactorEnabled: state !== "unenrolled",
+    } });
+    await database.collection("twoFactor").deleteOne({ _id: factor._id });
+    if (state !== "missing-factor") await database.collection("twoFactor").insertOne({ ...factor, secret: state === "empty-factor" ? "" : factor.secret });
+    const deletion = await post("/api/account/delete", admin.cookie, { confirmation: "DELETE" });
+    assert.equal(deletion.status, 409, `${state}: ${await deletion.text()}`);
+    await assert.rejects(withDatabaseTransaction((session) => setAuthUserRole(admin.id, "user", { session })), { status: 409 });
+    await assert.rejects(withDatabaseTransaction((session) => suspendAuthUser(admin.id, "Local safeguard check", { session })), { status: 409 });
+    const kept = await database.collection("user").findOne({ _id: admin._id });
+    assert.equal(kept.role, "admin");
+    assert.equal(kept.banned, false);
+    assert.equal((await Poll.findById(poll._id)).deletedAt, null);
+  }
+  await database.collection("twoFactor").replaceOne({ _id: factor._id }, factor);
+  const deletion = await post("/api/account/delete", admin.cookie, { confirmation: "DELETE" });
+  assert.equal(deletion.status, 204, await deletion.text());
+  assert.equal(await database.collection("user").countDocuments({ _id: admin._id }), 0);
+  assert.equal(await database.collection("user").countDocuments({ _id: backup._id }), 1);
+});
+
+test("backup administrator checks support legacy ID links and exclude the departing account", async () => {
+  const { assertAdminWillRemain, lockAdminChanges } = await import("../src/services/user-admin.js");
+  const admin = await createUser("admin");
+  await enrollFactor(admin);
+  const check = () => withDatabaseTransaction(async (session) => {
+    await lockAdminChanges(session);
+    const user = await database.collection("user").findOne({ _id: admin._id }, { session });
+    await assertAdminWillRemain(user, { session });
+  });
+  await assert.rejects(check(), { status: 409 });
+  const backup = await createUser("admin");
+  await enrollFactor(backup);
+  const user = await database.collection("user").findOne({ _id: backup._id });
+  const factor = await database.collection("twoFactor").findOne({ userId: { $in: [backup.id, backup._id] } });
+  let previousId = backup._id;
+  for (const [userId, factorUserId] of [[backup._id, backup.id], [backup.id, backup._id], ["legacy-backup", "legacy-backup"]]) {
+    await database.collection("user").deleteOne({ _id: previousId });
+    await database.collection("user").insertOne({ ...user, _id: userId, role: "moderator,admin" });
+    await database.collection("twoFactor").updateOne({ _id: factor._id }, { $set: { userId: factorUserId } });
+    await check();
+    previousId = userId;
+  }
+});
+
+test("concurrent recovery and administrator deletion leave an enrolled administrator", async () => {
+  const admin = await createUser("admin");
+  const backup = await createUser("admin");
+  await enrollFactor(admin);
+  await enrollFactor(backup);
+  const recovery = await startRecovery(backup);
+  const [approval, deletion] = await Promise.all([
+    post(`/api/moderation/recovery/${recovery.requestId}/approve`, admin.cookie, approveBody),
+    post("/api/account/delete", admin.cookie, { confirmation: "DELETE" }),
+  ]);
+  if (approval.status === 200) {
+    assert.equal(deletion.status, 409, await deletion.text());
+    assert.equal(await ModerationAction.countDocuments({ action: "factor_recovered" }), 1);
+  } else {
+    assert.ok([401, 403].includes(approval.status), await approval.text());
+    assert.equal(deletion.status, 204, await deletion.text());
+    assert.equal(await ModerationAction.countDocuments({ action: "factor_recovered" }), 0);
+  }
+  const remaining = await database.collection("user").find({ role: "admin", banned: false, emailVerified: true, twoFactorEnabled: true }).toArray();
+  assert.equal(remaining.length, 1);
+  assert.ok(await database.collection("twoFactor").findOne({ userId: { $in: [remaining[0]._id, String(remaining[0]._id)] } }));
 });
 
 test("concurrent duplicate votes create exactly one receipt and one count", async () => {

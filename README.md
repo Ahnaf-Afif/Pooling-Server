@@ -144,6 +144,13 @@ Account security lists signed-in devices without exposing session tokens. Revoki
 
 The current index migration includes the recovery indexes introduced in `2026-09-account-recovery-v5`. Request records expire after 24 hours. Apply and verify indexes before promoting this backend and its matching account/admin UI.
 
+Deleting, demoting or suspending an active administrator requires a different
+active administrator with verified email, completed MFA enrollment and a stored
+authenticator record. The check excludes the departing account and coordinates
+with concurrent role, deletion and recovery operations. It cannot prove that a
+person still controls their provider account or device; test backup access before
+relying on it. An administrator role without enrollment is not a usable backup.
+
 Suspending a poll owner revokes their sessions but deliberately leaves content reports pending. Staff must separately edit/remove the content or dismiss the report. Reports for content already removed can be resolved with an audit reason.
 
 ### Concurrent account changes

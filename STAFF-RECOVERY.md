@@ -5,6 +5,15 @@ Choose a second trusted administrator, enroll and verify their authenticator,
 save their recovery codes offline, and test both accounts before launch. Keep
 Vercel, Atlas, Google and the support mailbox recoverable separately.
 
+The application refuses to delete, demote or suspend an active administrator
+unless a different administrator has verified email, is not suspended, has
+completed MFA enrollment and still has a stored authenticator record. These
+checks share the administrator transaction guard with recovery approvals, so a
+concurrent factor reset cannot silently remove the only eligible backup. A role
+label alone is not sufficient. This checks stored enrollment, not whether the
+person still controls their Google account, mailbox or authenticator: regularly
+test both administrators' access and keep their recovery codes separately secured.
+
 ## Replace recovery codes while you still have a factor
 
 1. Open Account → Account security and verify an authenticator or unused code.

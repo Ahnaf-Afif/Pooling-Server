@@ -63,11 +63,28 @@ export async function lockAdminChanges(session) {
 
 export async function assertAdminWillRemain(user, { session } = {}) {
   if (!ADMIN_ROLE.test(String(user.role || "")) || user.banned) return;
-  const activeAdmins = await AuthUser.countDocuments(
-    { role: ADMIN_ROLE, banned: { $ne: true } },
-  ).session(session || null);
-  if (activeAdmins <= 1) {
-    throw new UserAdminError("Create another active administrator before changing this account", 409);
+  if (!session) throw new Error("Administrator safeguards require a transaction");
+  // Callers hold the shared administrator guard. Count a different, verified,
+  // enrolled administrator, not an account that merely has the role label.
+  const [backup] = await AuthUser.aggregate([
+    { $match: {
+      _id: { $nin: idCandidates(String(user._id ?? user.id)) },
+      role: ADMIN_ROLE, banned: { $ne: true }, emailVerified: true, twoFactorEnabled: true,
+    } },
+    // Better Auth installations can contain either string or ObjectId links.
+    { $project: { identityIds: ["$_id", { $toString: "$_id" }, { $convert: { input: "$_id", to: "objectId", onError: null, onNull: null } }] } },
+    { $lookup: {
+      from: "twoFactor", localField: "identityIds", foreignField: "userId", as: "factor",
+      pipeline: [
+        { $match: { userId: { $ne: null }, secret: { $type: "string", $ne: "" } } },
+        { $limit: 1 }, { $project: { _id: 1 } },
+      ],
+    } },
+    { $match: { "factor.0": { $exists: true } } },
+    { $limit: 1 }, { $project: { _id: 1 } },
+  ]).session(session).option({ maxTimeMS: 5000 });
+  if (!backup) {
+    throw new UserAdminError("Verify another active administrator's email and authenticator before changing this account", 409);
   }
 }
 
