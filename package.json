@@ -10,6 +10,8 @@
     "dev": "node --watch src/local.js",
     "start": "node src/local.js",
     "lint": "node scripts/check-syntax.js",
+    "check:production": "node scripts/check-production.js",
+    "check:release": "node scripts/smoke-release.js",
     "test": "node --test --test-timeout=15000 test/*.test.js",
     "test:integration": "node --test --test-timeout=240000 integration/*.test.js",
     "db:indexes": "node scripts/sync-indexes.js",

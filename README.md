@@ -32,6 +32,14 @@ Vercel discovers `src/app.js` and uses its default Express app export. The separ
 
 Set all server variables from `.env.example` in the Vercel project's **Production** environment. Use `BETTER_AUTH_URL=https://pooling-client.vercel.app` and a unique random `BETTER_AUTH_SECRET` with at least 32 characters. Do not set `PORT` for the Vercel function. Redeploy after changing variables. The database connections are opened on demand and reused by warm function instances.
 
+The backend build now runs `npm run check:production` through `vercel.json`.
+It fails before release if required production configuration or the real Express
+entrypoint is invalid. It reads the supplied environment, not `.env`; production
+`CLIENT_ORIGINS` must explicitly list HTTPS origins and include `BETTER_AUTH_URL`.
+Google-only operation does not require Resend. Never replace an existing auth or
+voter key with a new random value during an upgrade. See [RELEASE.md](RELEASE.md)
+for staged promotion, read-only smoke checks, outage response and rollback limits.
+
 ## API
 
 - `GET /api/health` — readiness check

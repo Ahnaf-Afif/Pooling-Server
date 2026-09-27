@@ -7,8 +7,10 @@ import { getClientOrigins } from "./config.js";
 import { getMongoClient, getMongoDatabase } from "./db.js";
 import { getVoterSecret } from "./voter.js";
 import { parseAuthSecrets } from "./auth-secrets.js";
+import { assertProductionConfig } from "./production-config.js";
 
 // Validate before serving any requests, not only on the first vote.
+if (process.env.NODE_ENV === "production") assertProductionConfig();
 getVoterSecret();
 
 const splitList = (value) => new Set(
@@ -22,9 +24,6 @@ const adminEmails = splitList(process.env.ADMIN_EMAILS);
 const moderatorEmails = splitList(process.env.MODERATOR_EMAILS);
 const authSecret = process.env.BETTER_AUTH_SECRET?.trim();
 const authBaseUrl = process.env.BETTER_AUTH_URL?.trim();
-if (process.env.NODE_ENV === "production" && (!authSecret || !authBaseUrl)) {
-  throw new Error("BETTER_AUTH_SECRET and BETTER_AUTH_URL are required in production");
-}
 const googleConfigured = Boolean(
   process.env.GOOGLE_CLIENT_ID?.trim() && process.env.GOOGLE_CLIENT_SECRET?.trim(),
 );

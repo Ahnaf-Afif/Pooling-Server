@@ -13,10 +13,13 @@ export function getConfig() {
 }
 
 export function getClientOrigins() {
-  const configured = (process.env.CLIENT_ORIGINS || "http://localhost:3000")
+  const configured = (process.env.CLIENT_ORIGINS || (process.env.NODE_ENV === "production" ? "" : "http://localhost:3000"))
     .split(",")
     .map((origin) => origin.trim())
     .filter(Boolean);
 
-  return [...new Set([...configured, "https://pooling-client.vercel.app"])];
+  // Production origins must be explicit; never add a development or old hostname.
+  return [...new Set(process.env.NODE_ENV === "production"
+    ? configured
+    : [...configured, "https://pooling-client.vercel.app"])];
 }

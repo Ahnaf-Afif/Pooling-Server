@@ -1,0 +1,25 @@
+name: Public release health
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '*/15 * * * *'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: public-release-health
+  cancel-in-progress: true
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.x
+      # The smoke command uses only built-in Node APIs. No credentials/install needed.
+      - run: node scripts/smoke-release.js --api https://pooling-server.vercel.app --site https://pooling-client.vercel.app
