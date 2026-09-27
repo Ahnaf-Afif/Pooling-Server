@@ -35,11 +35,15 @@ const original = {
   userFindOne: AuthUser.findOne,
   userFindOneAndUpdate: AuthUser.findOneAndUpdate,
   sessionDeleteMany: AuthSession.deleteMany,
+  userUpdateOne: AuthUser.updateOne,
+  sessionFindOne: AuthSession.findOne,
+  sessionUpdateOne: AuthSession.updateOne,
 };
 const seen = {};
 let currentPoll;
 let currentReport;
 let currentUser;
+let currentActor;
 let server;
 let baseUrl;
 
@@ -111,9 +115,10 @@ before(async () => {
   app.use(express.json());
   app.use((request, _response, next) => {
     const role = request.headers["x-test-role"] || "admin";
+    currentActor = { _id: "admin-user", name: "Test Admin", email: "admin@example.com", role, emailVerified: true, twoFactorEnabled: true };
     request.auth = {
       user: { id: "admin-user", name: "Test Admin", email: "admin@example.com", role, emailVerified: true, twoFactorEnabled: true },
-      session: { createdAt: new Date(), mfaVerifiedAt: new Date() },
+      session: { token: "test-staff-token", createdAt: new Date(), mfaVerifiedAt: new Date() },
     };
     next();
   });
@@ -163,7 +168,9 @@ beforeEach(() => {
 
   AuthUser.find = () => queryResult([currentUser]);
   AuthUser.countDocuments = async (filter) => filter?.role ? 2 : 1;
-  AuthUser.findOne = () => queryResult(currentUser);
+  AuthUser.findOne = (filter) => queryResult(filter._id?.$in?.includes("admin-user") ? currentActor : currentUser);
+  AuthSession.findOne = () => queryResult({ _id: "staff-session", userId: "admin-user", createdAt: new Date(), mfaVerifiedAt: new Date(), expiresAt: new Date(Date.now() + 60_000) });
+  AuthUser.updateOne = AuthSession.updateOne = async () => ({ matchedCount: 1 });
   AuthUser.findOneAndUpdate = (_filter, update) => {
     currentUser = { ...currentUser, ...(update.$set || {}) };
     for (const key of Object.keys(update.$unset || {})) delete currentUser[key];
@@ -194,6 +201,9 @@ after(async () => {
   AuthUser.findOne = original.userFindOne;
   AuthUser.findOneAndUpdate = original.userFindOneAndUpdate;
   AuthSession.deleteMany = original.sessionDeleteMany;
+  AuthUser.updateOne = original.userUpdateOne;
+  AuthSession.findOne = original.sessionFindOne;
+  AuthSession.updateOne = original.sessionUpdateOne;
   await closeDatabases();
 });
 

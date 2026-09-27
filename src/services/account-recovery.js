@@ -5,8 +5,8 @@ import { auth } from "../auth.js";
 import { getMongoDatabase, withDatabaseTransaction } from "../db.js";
 import RecoveryRequest from "../models/RecoveryRequest.js";
 import ModerationAction from "../models/ModerationAction.js";
-import { isRecent, STAFF_SESSION_MS } from "../security-policy.js";
 import { idCandidates, lockAdminChanges, UserAdminError } from "./user-admin.js";
+import { lockIdentity } from "./identity-transaction.js";
 
 const userFilter = (id) => ({ _id: { $in: idCandidates(id) } });
 const factorFilter = (id) => ({ userId: { $in: idCandidates(id) } });
@@ -15,22 +15,6 @@ const fail = (message, status = 409) => { throw new UserAdminError(message, stat
 
 export function publicRecovery(request) {
   return request ? { requestId: request.requestId, status: request.status, expiresAt: request.expiresAt } : null;
-}
-
-// Recheck and write-lock the real session and user inside the transaction:
-// revocation, deletion, suspension and a concurrent recovery must not race us.
-async function lockIdentity(identity, session, { freshSignIn = false, administrator = false } = {}) {
-  const database = getMongoDatabase();
-  const user = await database.collection("user").findOne(userFilter(identity.user.id), { session });
-  const current = await database.collection("session").findOne({ token: identity.session.token, ...factorFilter(identity.user.id) }, { session });
-  if (!user || user.banned || !user.emailVerified || !current || current.expiresAt <= new Date()) fail("Sign in with an active verified account", 401);
-  if (freshSignIn ? !isRecent(current.createdAt) : !user.twoFactorEnabled || !isRecent(current.mfaVerifiedAt)) {
-    fail(freshSignIn ? "Sign out and sign in again before requesting recovery" : "Verify your authenticator or a recovery code before this action", 403);
-  }
-  if (administrator && (!String(user.role || "").split(",").includes("admin") || !isRecent(current.createdAt, STAFF_SESSION_MS))) fail("Fresh administrator verification required", 403);
-  await database.collection("user").updateOne({ _id: user._id }, { $inc: { securityRevision: 1 } }, { session });
-  await database.collection("session").updateOne({ _id: current._id }, { $inc: { securityRevision: 1 } }, { session });
-  return { user, current };
 }
 
 export async function replaceRecoveryCodes(identity) {
@@ -44,7 +28,7 @@ export async function replaceRecoveryCodes(identity) {
   const context = await auth.$context;
   const encrypted = await symmetricEncrypt({ key: context.secretConfig, data: JSON.stringify(backupCodes) });
   await withDatabaseTransaction(async (session) => {
-    const { current } = await lockIdentity(identity, session);
+    const { current } = await lockIdentity(identity, session, { factor: true });
     const updated = await database.collection("twoFactor").updateOne(
       { _id: factor._id, secret: factor.secret, backupCodes: factor.backupCodes },
       { $set: { backupCodes: encrypted } }, { session },
@@ -77,7 +61,7 @@ export async function requestRecovery(identity) {
 export async function approveRecovery(identity, requestId, note) {
   return withDatabaseTransaction(async (session) => {
     await lockAdminChanges(session);
-    const { user: actor } = await lockIdentity(identity, session, { administrator: true });
+    const { user: actor } = await lockIdentity(identity, session, { role: "admin" });
     const request = await RecoveryRequest.findOne({ requestId }).select("+factorFingerprint").session(session);
     if (!request || request.expiresAt <= new Date()) fail("Recovery request expired or was cancelled", 404);
     if (request._id === identity.user.id) fail("Another administrator must approve your recovery", 403);

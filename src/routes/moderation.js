@@ -2,7 +2,7 @@ import { Router } from "express";
 import mongoose from "mongoose";
 
 import { requireAdmin, requireModerator } from "../auth-middleware.js";
-import { withDatabaseTransaction } from "../db.js";
+import { withIdentityTransaction } from "../services/identity-transaction.js";
 import ModerationAction from "../models/ModerationAction.js";
 import Poll from "../models/Poll.js";
 import Report from "../models/Report.js";
@@ -80,12 +80,12 @@ function cleanNote(body, { required = false, minimum = 1, maximum = 500 } = {}) 
   return { note };
 }
 
-function actorFrom(request) {
-  return {
-    actorId: request.auth.user.id,
-    actorName: (request.auth.user.name || request.auth.user.email || "Moderator").trim().slice(0, 160),
-    actorRole: request.auth.effectiveRole,
-  };
+function withStaffTransaction(request, work, role = "staff") {
+  return withIdentityTransaction(request.auth, (session, { user, effectiveRole }) => work(session, {
+    actorId: String(user._id),
+    actorName: (user.name || user.email || "Moderator").trim().slice(0, 160),
+    actorRole: effectiveRole,
+  }), { role, adminChanges: role === "admin" });
 }
 
 function serializeAction(action) {
@@ -273,7 +273,7 @@ router.patch("/polls/:slug", limitWrites, async (request, response, next) => {
     if (error) return response.status(400).json({ message: error });
     const { errors, value } = validatePoll(request.body);
     if (errors.length) return response.status(400).json({ message: errors[0], errors });
-    const result = await withDatabaseTransaction(async (session) => {
+    const result = await withStaffTransaction(request, async (session, actor) => {
       const poll = await withSession(
         Poll.findOne({ slug: request.params.slug, deletedAt: null }),
         session,
@@ -281,7 +281,7 @@ router.patch("/polls/:slug", limitWrites, async (request, response, next) => {
       if (!poll) throw new ModerationRequestError("Poll not found", 404);
       const update = await updatePollContent(poll, value, session);
       const action = await createAction({
-        ...actorFrom(request),
+        ...actor,
         action: "poll_edited",
         pollSlug: poll.slug,
         targetUserId: poll.creatorId || null,
@@ -365,7 +365,7 @@ router.patch("/reports/:id", limitWrites, async (request, response, next) => {
     }
     const { note, error } = cleanNote(request.body, { required: true, minimum: 3 });
     if (error) return response.status(400).json({ message: error });
-    await withDatabaseTransaction(async (session) => {
+    await withStaffTransaction(request, async (session, actor) => {
       const report = await findReport(request.params.id, { session });
       if (report.status === status) return;
       report.status = status;
@@ -373,7 +373,7 @@ router.patch("/reports/:id", limitWrites, async (request, response, next) => {
       report.reviewedAt = status === "dismissed" ? new Date() : null;
       await report.save({ session });
       await createAction({
-        ...actorFrom(request),
+        ...actor,
         action: status === "dismissed" ? "report_dismissed" : "report_reopened",
         reportId: report._id,
         pollSlug: report.pollSlug,
@@ -390,14 +390,15 @@ router.post("/reports/:id/notes", limitWrites, async (request, response, next) =
   try {
     const { note, error } = cleanNote(request.body, { required: true, minimum: 2 });
     if (error) return response.status(400).json({ message: error });
-    const report = await findReport(request.params.id);
-
-    const action = await ModerationAction.create({
-      ...actorFrom(request),
-      action: "note_added",
-      reportId: report._id,
-      pollSlug: report.pollSlug,
-      note,
+    const action = await withStaffTransaction(request, async (session, actor) => {
+      const report = await findReport(request.params.id, { session });
+      return createAction({
+        ...actor,
+        action: "note_added",
+        reportId: report._id,
+        pollSlug: report.pollSlug,
+        note,
+      }, session);
     });
     return response.status(201).json({ action: serializeAction(action) });
   } catch (error) {
@@ -411,7 +412,7 @@ router.patch("/reports/:id/poll", limitWrites, async (request, response, next) =
     if (error) return response.status(400).json({ message: error });
     const { errors, value } = validatePoll(request.body);
     if (errors.length) return response.status(400).json({ message: errors[0], errors });
-    const affectedReports = await withDatabaseTransaction(async (session) => {
+    const affectedReports = await withStaffTransaction(request, async (session, actor) => {
       const report = await findReport(request.params.id, { pending: true, session });
       const poll = await withSession(
         Poll.findOne({ slug: report.pollSlug, deletedAt: null }),
@@ -422,7 +423,7 @@ router.patch("/reports/:id/poll", limitWrites, async (request, response, next) =
       return resolvePendingReports({
         pollSlug: report.pollSlug,
         action: "poll_edited",
-        actor: actorFrom(request),
+        actor,
         targetUserId: poll.creatorId || null,
         note,
         before: result.before,
@@ -446,7 +447,7 @@ router.post("/reports/:id/remove-poll", limitWrites, async (request, response, n
   try {
     const { note, error } = cleanNote(request.body, { required: true, minimum: 3 });
     if (error) return response.status(400).json({ message: error });
-    const affectedReports = await withDatabaseTransaction(async (session) => {
+    const affectedReports = await withStaffTransaction(request, async (session, actor) => {
       const report = await findReport(request.params.id, { pending: true, session });
       const poll = await withSession(Poll.findOne({ slug: report.pollSlug }), session);
       const before = pollSnapshot(poll);
@@ -459,7 +460,7 @@ router.post("/reports/:id/remove-poll", limitWrites, async (request, response, n
       return resolvePendingReports({
         pollSlug: report.pollSlug,
         action: "poll_removed",
-        actor: actorFrom(request),
+        actor,
         targetUserId: poll?.creatorId || null,
         note,
         before,
@@ -482,7 +483,7 @@ router.post("/reports/:id/suspend-owner", requireAdmin, limitWrites, async (requ
   try {
     const { note, error } = cleanNote(request.body);
     if (error) return response.status(400).json({ message: error });
-    await withDatabaseTransaction(async (session) => {
+    await withStaffTransaction(request, async (session, actor) => {
       const report = await findReport(request.params.id, { pending: true, session });
       const poll = await withSession(Poll.findOne({ slug: report.pollSlug }), session);
       if (!poll?.creatorId) {
@@ -498,13 +499,13 @@ router.post("/reports/:id/suspend-owner", requireAdmin, limitWrites, async (requ
         pollSlug: report.pollSlug,
         reportId: report._id,
         action: "owner_suspended",
-        ...actorFrom(request),
+        ...actor,
         targetUserId: poll.creatorId,
         note: reason,
         before: pollSnapshot(poll),
         after: pollSnapshot(poll),
       }, session);
-    });
+    }, "admin");
     return response.json({ message: "Poll owner suspended. Reports remain pending until the content is reviewed." });
   } catch (error) {
     return sendAdminError(error, response, next);
@@ -536,14 +537,14 @@ router.patch("/users/:id/role", requireAdmin, limitWrites, async (request, respo
     if (request.params.id === request.auth.user.id) {
       return response.status(400).json({ message: "Another administrator must change your role" });
     }
-    const user = await withDatabaseTransaction(async (session) => {
+    const user = await withStaffTransaction(request, async (session, actor) => {
       const currentUser = await findAuthUserById(request.params.id, { session });
       if (!currentUser) throw new UserAdminError("User not found", 404);
       const previousRole = USER_ROLES.includes(currentUser.role) ? currentUser.role : "user";
       if (previousRole === role) return currentUser;
       const updated = await setAuthUserRole(request.params.id, role, { session });
       await createAction({
-        ...actorFrom(request),
+        ...actor,
         action: "role_changed",
         targetUserId: request.params.id,
         previousRole,
@@ -551,7 +552,7 @@ router.patch("/users/:id/role", requireAdmin, limitWrites, async (request, respo
         note: `Role changed from ${previousRole} to ${role}; active sessions revoked`,
       }, session);
       return updated;
-    });
+    }, "admin");
     return response.json({ user: serializeUser(user) });
   } catch (error) {
     return sendAdminError(error, response, next);
@@ -565,16 +566,16 @@ router.post("/users/:id/suspend", requireAdmin, limitWrites, async (request, res
     if (request.params.id === request.auth.user.id) {
       return response.status(400).json({ message: "You cannot suspend your own account" });
     }
-    const user = await withDatabaseTransaction(async (session) => {
+    const user = await withStaffTransaction(request, async (session, actor) => {
       const updated = await suspendAuthUser(request.params.id, note, { session });
       await createAction({
-        ...actorFrom(request),
+        ...actor,
         action: "user_suspended",
         targetUserId: request.params.id,
         note,
       }, session);
       return updated;
-    });
+    }, "admin");
     return response.json({ user: serializeUser(user) });
   } catch (error) {
     return sendAdminError(error, response, next);
@@ -585,16 +586,16 @@ router.post("/users/:id/reactivate", requireAdmin, limitWrites, async (request, 
   try {
     const { note, error } = cleanNote(request.body);
     if (error) return response.status(400).json({ message: error });
-    const user = await withDatabaseTransaction(async (session) => {
+    const user = await withStaffTransaction(request, async (session, actor) => {
       const updated = await reactivateAuthUser(request.params.id, { session });
       await createAction({
-        ...actorFrom(request),
+        ...actor,
         action: "user_reactivated",
         targetUserId: request.params.id,
         note,
       }, session);
       return updated;
-    });
+    }, "admin");
     return response.json({ user: serializeUser(user) });
   } catch (error) {
     return sendAdminError(error, response, next);

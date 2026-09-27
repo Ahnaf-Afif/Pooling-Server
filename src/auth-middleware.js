@@ -27,6 +27,7 @@ export async function requireVerifiedUser(request, response, next) {
     if (!session.user.emailVerified) {
       return response.status(403).json({ message: "Verify your email to continue" });
     }
+    if (session.user.banned) return response.status(403).json({ message: "This account is suspended" });
     return next();
   } catch (error) {
     return next(error);

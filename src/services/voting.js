@@ -1,6 +1,7 @@
 import { withDatabaseTransaction } from "../db.js";
 import Poll from "../models/Poll.js";
 import VoteReceipt from "../models/VoteReceipt.js";
+import { lockIdentity, withIdentityTransaction } from "./identity-transaction.js";
 
 export class VoteError extends Error {
   constructor(message, status) { super(message); this.status = status; }
@@ -16,9 +17,10 @@ async function replayVote(pollSlug, voterKey, optionId, session = null) {
   return { poll, replayed: true };
 }
 
-export async function recordVote({ pollSlug, voterKey, optionId }) {
+export async function recordVote({ pollSlug, voterKey, optionId, identity }) {
   try {
     return await withDatabaseTransaction(async (session) => {
+      if (identity?.user) await lockIdentity(identity, session);
       const existing = await replayVote(pollSlug, voterKey, optionId, session);
       if (existing) return existing;
       await VoteReceipt.create([{ pollSlug, voterKey, optionId }], { session });
@@ -35,7 +37,9 @@ export async function recordVote({ pollSlug, voterKey, optionId }) {
     // Two simultaneous requests may race on the unique receipt index. Read
     // the committed winner outside the aborted transaction, without recounting.
     if (error.code === 11000) {
-      const existing = await replayVote(pollSlug, voterKey, optionId);
+      const existing = identity?.user
+        ? await withIdentityTransaction(identity, (session) => replayVote(pollSlug, voterKey, optionId, session))
+        : await replayVote(pollSlug, voterKey, optionId);
       if (existing) return existing;
     }
     throw error;

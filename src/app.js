@@ -13,6 +13,7 @@ import moderationRoutes from "./routes/moderation.js";
 import accountRoutes from "./routes/account.js";
 import securityRoutes from "./routes/security.js";
 import pollRoutes from "./routes/polls.js";
+import { IdentityError } from "./services/identity-transaction.js";
 
 export function createApp(clientOrigins = getClientOrigins()) {
   const app = express();
@@ -83,13 +84,14 @@ export function createApp(clientOrigins = getClientOrigins()) {
   app.use((error, request, response, _next) => {
     const isBadRequest = error.name === "ValidationError" || error.type === "entity.parse.failed";
     const isPayloadTooLarge = error.type === "entity.too.large";
-    const status = isPayloadTooLarge ? 413 : isBadRequest ? 400 : error.message === "Origin is not allowed" ? 403 : 500;
+    const status = error instanceof IdentityError ? error.status : isPayloadTooLarge ? 413 : isBadRequest ? 400 : error.message === "Origin is not allowed" ? 403 : 500;
     if (status === 500) {
       console.error(JSON.stringify({ level: "error", event: "request_failed", requestId: request.id, error: error.message, stack: error.stack }));
     }
     response.status(status).json({
       message: isPayloadTooLarge ? "The request body is too large" : isBadRequest ? "The request data is invalid" : status === 500 ? "Something went wrong" : error.message,
       requestId: request.id,
+      ...(error instanceof IdentityError && error.code ? { code: error.code } : {}),
     });
   });
 

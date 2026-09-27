@@ -12,6 +12,45 @@ let replicaSet, server, baseUrl, database, auth, closeDatabases, withDatabaseTra
 let Poll, Report, ModerationAction, VoteReceipt, AdminGuard, setAuthUserRole;
 const secret = "integration-test-secret-only-0123456789abcdef";
 
+function latch() {
+  let resolve;
+  const promise = new Promise((done) => { resolve = done; });
+  return { promise, resolve };
+}
+
+async function reached(promise) {
+  let timer;
+  try {
+    await Promise.race([promise, new Promise((_, reject) => {
+      timer = setTimeout(() => reject(new Error("Expected concurrent request did not reach its gate")), 5000);
+    })]);
+  } finally { clearTimeout(timer); }
+}
+
+// Pause a real request after middleware authorized it, without mocking the
+// database result. The pending transaction must see/retry actual concurrent changes.
+async function pauseIdentityRead(userId) {
+  const { default: User } = await import("../src/models/AuthUser.js");
+  const original = User.findOne;
+  const entered = latch();
+  const release = latch();
+  let used = false;
+  User.findOne = function (...args) {
+    const query = original.apply(this, args);
+    if (!used && args[0]?._id?.$in?.some((id) => String(id) === userId)) {
+      used = true;
+      const lean = query.lean;
+      query.lean = async function (...options) {
+        entered.resolve();
+        await release.promise;
+        return lean.apply(this, options);
+      };
+    }
+    return query;
+  };
+  return { entered: entered.promise, resume: () => release.resolve(), restore() { User.findOne = original; release.resolve(); } };
+}
+
 before(async () => {
   replicaSet = await MongoMemoryReplSet.create({
     binary: {
@@ -897,4 +936,162 @@ test("staff cursor queries seek ordered indexes instead of scanning earlier page
     assert.equal(explanation.executionStats.nReturned, 11);
     assert.ok(explanation.executionStats.totalDocsExamined <= 40, `${model.modelName} examined ${explanation.executionStats.totalDocsExamined} documents`);
   }
+});
+
+test("deletion rejects already-authorized poll, report and vote requests without orphaned account links", async () => {
+  const { getAccountVoterKey } = await import("../src/voter.js");
+  for (const kind of ["poll", "report", "vote"]) {
+    const user = await createUser();
+    const poll = await createPoll();
+    const path = kind === "poll" ? "/api/polls" : `/api/polls/${poll.slug}/${kind === "report" ? "reports" : "votes"}`;
+    const body = kind === "poll" ? { question: "A concurrent local question?", category: "Tech", options: ["One", "Two"] }
+      : kind === "report" ? { reason: "spam", details: "Local race check" } : { optionId: String(poll.options[0]._id) };
+    const gate = await pauseIdentityRead(user.id);
+    const pending = post(path, user.cookie, body);
+    try {
+      await reached(gate.entered);
+      const deleted = await post("/api/account/delete", user.cookie, { confirmation: "DELETE" });
+      assert.equal(deleted.status, 204, await deleted.text());
+      gate.resume();
+      const result = await pending;
+      assert.equal(result.status, 401, `${kind}: ${await result.text()}`);
+      assert.equal(await Poll.countDocuments({ creatorId: user.id }), 0);
+      assert.equal(await Report.countDocuments({ reporterUserId: user.id }), 0);
+      assert.equal(await VoteReceipt.countDocuments({ voterKey: getAccountVoterKey(user.id) }), 0);
+      assert.equal((await Poll.findById(poll._id)).totalVotes, 0);
+    } finally { gate.restore(); await pending.catch(() => {}); }
+  }
+});
+
+test("writes that lock first commit before deletion, and deletion retries then cleans every new link", async () => {
+  const { default: User } = await import("../src/models/AuthUser.js");
+  const { getAccountVoterKey } = await import("../src/voter.js");
+  for (const [kind, model] of [["poll", Poll], ["report", Report], ["vote", VoteReceipt]]) {
+    const user = await createUser();
+    const poll = await createPoll();
+    const path = kind === "poll" ? "/api/polls" : `/api/polls/${poll.slug}/${kind === "report" ? "reports" : "votes"}`;
+    const body = kind === "poll" ? { question: "A local committed question?", category: "Tech", options: ["One", "Two"] }
+      : kind === "report" ? { reason: "spam" } : { optionId: String(poll.options[0]._id) };
+    const originalCreate = model.create;
+    const originalUpdate = User.updateOne;
+    const entered = latch(), release = latch(), conflict = latch();
+    let held = false;
+    model.create = async function (...args) {
+      if (!held) { held = true; entered.resolve(); await release.promise; }
+      return originalCreate.apply(this, args);
+    };
+    const pending = post(path, user.cookie, body);
+    let deletion;
+    try {
+      await reached(entered.promise); // Both identity documents are already write-locked.
+      User.updateOne = async function (...args) {
+        try { return await originalUpdate.apply(this, args); }
+        catch (error) { if (error.code === 112) conflict.resolve(); throw error; }
+      };
+      deletion = post("/api/account/delete", user.cookie, { confirmation: "DELETE" });
+      await reached(conflict.promise); // A genuine MongoDB write conflict, not a mocked error.
+      release.resolve();
+      const written = await pending;
+      assert.equal(written.status, kind === "vote" ? 200 : 201, await written.clone().text());
+      const deleted = await deletion;
+      assert.equal(deleted.status, 204, await deleted.text());
+      assert.equal(await database.collection("user").countDocuments({ _id: user._id }), 0);
+      assert.equal(await database.collection("session").countDocuments({ userId: { $in: [user.id, user._id] } }), 0);
+      assert.equal(await Poll.countDocuments({ creatorId: user.id }), 0);
+      assert.equal(await Report.countDocuments({ reporterUserId: user.id }), 0);
+      assert.equal(await VoteReceipt.countDocuments({ voterKey: getAccountVoterKey(user.id) }), 0);
+      if (kind === "poll") {
+        const { poll: created } = await written.json();
+        const removed = await Poll.findOne({ slug: created.id });
+        assert.equal(removed.creatorId, null);
+        assert.ok(removed.deletedAt);
+      }
+      if (kind === "vote") {
+        assert.equal((await Poll.findById(poll._id)).totalVotes, 1);
+        assert.match((await VoteReceipt.findOne({ pollSlug: poll.slug })).voterKey, /^deleted:/);
+      }
+    } finally {
+      release.resolve();
+      model.create = originalCreate;
+      User.updateOne = originalUpdate;
+      await Promise.allSettled([pending, deletion].filter(Boolean));
+    }
+  }
+});
+
+test("session revocation stops an already-authorized poll creation", async () => {
+  const user = await createUser();
+  const context = await auth.$context;
+  const other = await context.internalAdapter.createSession(user.id, false);
+  const otherCookie = `better-auth.session_token=${encodeURIComponent(`${other.token}.${await makeSignature(other.token, secret)}`)}`;
+  const gate = await pauseIdentityRead(user.id);
+  const pending = post("/api/polls", user.cookie, { question: "A stale session question?", category: "Tech", options: ["One", "Two"] });
+  try {
+    await reached(gate.entered);
+    assert.equal((await post("/api/account/security/sessions/revoke", otherCookie, { others: true })).status, 200);
+    gate.resume();
+    assert.equal((await pending).status, 401);
+    assert.equal(await Poll.countDocuments({ creatorId: user.id }), 0);
+    assert.equal(await database.collection("session").countDocuments({}), 1);
+  } finally { gate.restore(); await pending.catch(() => {}); }
+});
+
+test("staff content writes recheck role, suspension, session and MFA after middleware", async () => {
+  for (const change of ["role", "ban", "session", "factor", "proof"]) {
+    const staff = await createUser("moderator");
+    await enrollFactor(staff);
+    const poll = await createPoll();
+    const gate = await pauseIdentityRead(staff.id);
+    const pending = fetch(`${baseUrl}/api/moderation/polls/${poll.slug}`, {
+      method: "PATCH", headers: { "Content-Type": "application/json", Cookie: staff.cookie },
+      body: JSON.stringify({ question: poll.question, category: "Food", options: ["One", "Two"], note: "Local concurrency check" }),
+    });
+    try {
+      await reached(gate.entered);
+      const userFilter = { _id: staff._id };
+      const sessionFilter = { userId: { $in: [staff.id, staff._id] } };
+      if (change === "role") await database.collection("user").updateOne(userFilter, { $set: { role: "user" } });
+      if (change === "ban") await database.collection("user").updateOne(userFilter, { $set: { banned: true } });
+      if (change === "factor") await database.collection("user").updateOne(userFilter, { $set: { twoFactorEnabled: false } });
+      if (change === "session") await database.collection("session").deleteMany(sessionFilter);
+      if (change === "proof") await database.collection("session").updateMany(sessionFilter, { $set: { mfaVerifiedAt: new Date(0) } });
+      gate.resume();
+      const response = await pending;
+      assert.equal(response.status, change === "session" ? 401 : 403, `${change}: ${await response.text()}`);
+      assert.equal((await Poll.findById(poll._id)).category, "Tech");
+      assert.equal(await ModerationAction.countDocuments({ actorId: staff.id }), 0);
+    } finally { gate.restore(); await pending.catch(() => {}); }
+  }
+});
+
+test("administrator-only writes cannot proceed with stale administrator authority", async () => {
+  const actor = await createUser("admin");
+  await enrollFactor(actor);
+  const target = await createUser();
+  const gate = await pauseIdentityRead(actor.id);
+  const pending = fetch(`${baseUrl}/api/moderation/users/${target.id}/role`, {
+    method: "PATCH", headers: { "Content-Type": "application/json", Cookie: actor.cookie }, body: JSON.stringify({ role: "admin" }),
+  });
+  try {
+    await reached(gate.entered);
+    // Simulates an independently changed database principal while the request is in flight.
+    await database.collection("user").updateOne({ _id: actor._id }, { $set: { role: "moderator" } });
+    gate.resume();
+    assert.equal((await pending).status, 403);
+    assert.equal((await database.collection("user").findOne({ _id: target._id })).role, "user");
+    assert.equal(await ModerationAction.countDocuments({ actorId: actor.id }), 0);
+  } finally { gate.restore(); await pending.catch(() => {}); }
+});
+
+test("identity revision writes roll back when the poll insert fails", async () => {
+  const user = await createUser();
+  const original = Poll.create;
+  Poll.create = async () => { throw new Error("Injected poll insert failure"); };
+  try {
+    const response = await post("/api/polls", user.cookie, { question: "A rollback question?", category: "Tech", options: ["One", "Two"] });
+    assert.equal(response.status, 500);
+    assert.equal(await Poll.countDocuments({}), 0);
+    assert.equal((await database.collection("user").findOne({ _id: user._id })).securityRevision, undefined);
+    assert.equal((await database.collection("session").findOne({ userId: { $in: [user.id, user._id] } })).securityRevision, undefined);
+  } finally { Poll.create = original; }
 });

@@ -11,6 +11,7 @@ import { limitSecurityAttempts, limitWrites } from "../rate-limit.js";
 import { hasRecentVerification, isRecent, isStaff, STAFF_SESSION_MS } from "../security-policy.js";
 import { idCandidates, UserAdminError } from "../services/user-admin.js";
 import { publicRecovery, replaceRecoveryCodes, requestRecovery } from "../services/account-recovery.js";
+import { withIdentityTransaction } from "../services/identity-transaction.js";
 
 const router = Router();
 router.use((_request, response, next) => { response.set("Cache-Control", "private, no-store"); next(); });
@@ -64,7 +65,8 @@ router.post("/recovery", limitSecurityAttempts, async (request, response, next) 
 
 router.post("/recovery/cancel", limitSecurityAttempts, async (request, response, next) => {
   try {
-    await RecoveryRequest.deleteOne({ _id: request.auth.user.id, status: "pending" });
+    await withIdentityTransaction(request.auth, (session) =>
+      RecoveryRequest.deleteOne({ _id: request.auth.user.id, status: "pending" }, { session }));
     return response.json({ message: "Pending recovery request cancelled" });
   } catch (error) { return next(error); }
 });
@@ -133,7 +135,7 @@ router.post("/sessions/revoke", requireRecentAuth, limitWrites, async (request, 
   try {
     const filter = { userId: { $in: idCandidates(request.auth.user.id) }, token: { $ne: request.auth.session.token } };
     if (request.body.others !== true) filter._id = { $in: idCandidates(request.body.id) };
-    await AuthSession.deleteMany(filter);
+    await withIdentityTransaction(request.auth, (session) => AuthSession.deleteMany(filter, { session }), { recent: true });
     return response.json({ message: "Selected sessions signed out" });
   } catch (error) { return next(error); }
 });

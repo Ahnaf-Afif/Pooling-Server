@@ -9,6 +9,8 @@ import Poll from "../src/models/Poll.js";
 import PlatformStats from "../src/models/PlatformStats.js";
 import RateBucket from "../src/models/RateBucket.js";
 import VoteReceipt from "../src/models/VoteReceipt.js";
+import AuthUser from "../src/models/AuthUser.js";
+import AuthSession from "../src/models/AuthSession.js";
 import pollRoutes from "../src/routes/polls.js";
 
 const originalPollMethods = {
@@ -21,6 +23,7 @@ const originalPollMethods = {
   findOneAndUpdate: Poll.findOneAndUpdate,
 };
 const originalTransaction = mongoose.connection.transaction;
+const originalIdentity = { userFind: AuthUser.findOne, userUpdate: AuthUser.updateOne, sessionFind: AuthSession.findOne, sessionUpdate: AuthSession.updateOne };
 const originalStats = {
   findById: PlatformStats.findById,
   findOneAndUpdate: PlatformStats.findOneAndUpdate,
@@ -57,8 +60,8 @@ before(async () => {
   Poll.distinct = async () => ["Tech", "Social"];
   Poll.countDocuments = async () => 2;
   Poll.create = async (data) => {
-    seen.createdPoll = data;
-    return { id: data.slug, ...data };
+    seen.createdPoll = data[0];
+    return [{ id: data[0].slug, ...data[0] }];
   };
   Poll.findOneAndUpdate = async (filter, update) => {
     seen.voteFilter = filter;
@@ -70,6 +73,10 @@ before(async () => {
   VoteReceipt.create = async (data) => [{ _id: "receipt-id", ...data[0] }];
   VoteReceipt.findOne = () => ({ session() { return this; }, lean: async () => null });
   VoteReceipt.deleteOne = async () => ({ deletedCount: 1 });
+  const stored = (value) => ({ session() { return this; }, lean: async () => value });
+  AuthUser.findOne = () => stored({ _id: "test-user", emailVerified: true, role: "user" });
+  AuthSession.findOne = () => stored({ _id: "test-session", userId: "test-user", token: "test-token", expiresAt: new Date(Date.now() + 60_000) });
+  AuthUser.updateOne = AuthSession.updateOne = async () => ({ matchedCount: 1 });
 
   const app = express();
   app.use(express.json());
@@ -77,7 +84,7 @@ before(async () => {
     const authState = request.headers["x-test-auth"];
     request.auth = authState === "none"
       ? { user: null }
-      : { user: { id: "test-user", emailVerified: authState !== "unverified" } };
+      : { user: { id: "test-user", emailVerified: authState !== "unverified" }, session: { token: "test-token" } };
     next();
   });
   app.use("/api/polls", pollRoutes);
@@ -92,6 +99,10 @@ after(async () => {
   mongoose.connection.transaction = originalTransaction;
   RateBucket.findOneAndUpdate = originalRateLimit;
   Object.assign(VoteReceipt, originalVoteReceiptMethods);
+  AuthUser.findOne = originalIdentity.userFind;
+  AuthUser.updateOne = originalIdentity.userUpdate;
+  AuthSession.findOne = originalIdentity.sessionFind;
+  AuthSession.updateOne = originalIdentity.sessionUpdate;
   await closeDatabases();
 });
 

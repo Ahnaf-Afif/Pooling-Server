@@ -13,6 +13,7 @@ import VoteReceipt from "../models/VoteReceipt.js";
 import { limitWrites } from "../rate-limit.js";
 import { getAccountVoterKey } from "../voter.js";
 import { assertAdminWillRemain, idCandidates, lockAdminChanges, UserAdminError } from "../services/user-admin.js";
+import { lockIdentity } from "../services/identity-transaction.js";
 
 const router = Router();
 
@@ -68,8 +69,7 @@ router.post("/delete", requireRecentAuth, limitWrites, async (request, response,
     const userId = request.auth.user.id;
     await withDatabaseTransaction(async (session) => {
       await lockAdminChanges(session);
-      const user = await AuthUser.findOne(accountFilter(userId)).session(session).lean();
-      if (!user) return;
+      const { user } = await lockIdentity(request.auth, session, { recent: true });
       await assertAdminWillRemain(user, { session });
 
       const now = new Date();

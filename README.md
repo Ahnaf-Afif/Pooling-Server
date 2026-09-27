@@ -146,6 +146,30 @@ The current index migration includes the recovery indexes introduced in `2026-09
 
 Suspending a poll owner revokes their sessions but deliberately leaves content reports pending. Staff must separately edit/remove the content or dismiss the report. Reports for content already removed can be resolved with an audit reason.
 
+### Concurrent account changes
+
+Application-owned authenticated writes recheck the stored account and session
+inside their database transaction. They update an internal revision on both
+records, coordinating poll creation/owner changes, signed-in votes/reports,
+moderation actions, account deletion, session revocation and recovery operations.
+If deletion or revocation wins, the old request is rejected; if an app write
+wins, deletion retries and removes/anonymizes its new links. Moderation also
+rechecks current role, staff-session age and MFA proof inside the transaction,
+and records the current stored actor rather than the earlier middleware snapshot.
+
+This coordination is per account/session, not a global vote lock. Administrator
+changes retain the shared last-admin guard. Failed transactions roll back the
+internal revisions as well as their business changes. These extra database
+operations and contention still need production capacity measurement.
+
+Guest voting remains public and uses its separate signed-cookie receipt; a
+rejected signed-in write does not silently switch to a guest within the same
+request. Signing out can still enable a separate anonymous vote. Better Auth's
+own OAuth/session creation and authenticator enable/verify/disable flows are not
+made transactionally atomic by this guard; their deletion/concurrency boundaries
+remain separate work. General creation/moderation idempotency, scalable account
+cleanup and retained free-text privacy also remain open.
+
 A poll is trending after at least three votes when its most recent vote was within seven days. Popular qualifying polls rank first, with recent activity breaking ties. Older records without an activity timestamp use their creation time during the transition.
 
 ## Checks

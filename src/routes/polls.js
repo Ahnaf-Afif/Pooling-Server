@@ -12,6 +12,7 @@ import { getVoterKey } from "../voter.js";
 import { paginatePolls, PaginationError } from "../services/poll-pagination.js";
 import { getPlatformStats } from "../services/platform-stats.js";
 import { recordVote, VoteError } from "../services/voting.js";
+import { withIdentityTransaction } from "../services/identity-transaction.js";
 
 const router = Router();
 const notDeleted = { deletedAt: null };
@@ -105,12 +106,15 @@ router.post("/", requireVerifiedUser, limitPollCreation, async (request, respons
     const { errors, value } = validatePoll(request.body);
     if (errors.length) return response.status(400).json({ message: errors[0], errors });
 
-    const poll = await Poll.create({
-      slug: createSlug(value.question),
-      question: value.question,
-      category: value.category,
-      options: value.options.map((label) => ({ label })),
-      creatorId: request.auth.user.id,
+    const poll = await withIdentityTransaction(request.auth, async (session) => {
+      const [created] = await Poll.create([{
+        slug: createSlug(value.question),
+        question: value.question,
+        category: value.category,
+        options: value.options.map((label) => ({ label })),
+        creatorId: request.auth.user.id,
+      }], { session });
+      return created;
     });
     return response.status(201).json({ poll });
   } catch (error) {
@@ -123,7 +127,7 @@ router.patch("/:slug", requireVerifiedUser, limitWrites, async (request, respons
     const { errors, value } = validatePoll(request.body);
     if (errors.length) return response.status(400).json({ message: errors[0], errors });
 
-    const poll = await Poll.findOneAndUpdate(
+    const poll = await withIdentityTransaction(request.auth, (session) => Poll.findOneAndUpdate(
       { ...ownerFilter(request), totalVotes: 0, status: activeStatus },
       {
         $set: {
@@ -132,8 +136,8 @@ router.patch("/:slug", requireVerifiedUser, limitWrites, async (request, respons
           options: value.options.map((label) => ({ label, votes: 0 })),
         },
       },
-      { returnDocument: "after", runValidators: true },
-    );
+      { returnDocument: "after", runValidators: true, session },
+    ));
     if (poll) return response.json({ poll });
 
     const existing = await Poll.findOne(ownerFilter(request));
@@ -150,11 +154,11 @@ router.patch("/:slug", requireVerifiedUser, limitWrites, async (request, respons
 
 router.post("/:slug/close", requireVerifiedUser, limitWrites, async (request, response, next) => {
   try {
-    const poll = await Poll.findOneAndUpdate(
+    const poll = await withIdentityTransaction(request.auth, (session) => Poll.findOneAndUpdate(
       { ...ownerFilter(request), status: activeStatus },
       { $set: { status: "closed", closedAt: new Date() } },
-      { returnDocument: "after", runValidators: true },
-    );
+      { returnDocument: "after", runValidators: true, session },
+    ));
     if (!poll) return response.status(404).json({ message: "Active poll not found" });
     return response.json({ poll });
   } catch (error) {
@@ -164,11 +168,11 @@ router.post("/:slug/close", requireVerifiedUser, limitWrites, async (request, re
 
 router.post("/:slug/archive", requireVerifiedUser, limitWrites, async (request, response, next) => {
   try {
-    const poll = await Poll.findOneAndUpdate(
+    const poll = await withIdentityTransaction(request.auth, (session) => Poll.findOneAndUpdate(
       ownerFilter(request),
       { $set: { status: "archived" } },
-      { returnDocument: "after", runValidators: true },
-    );
+      { returnDocument: "after", runValidators: true, session },
+    ));
     if (!poll) return response.status(404).json({ message: "Poll not found" });
     return response.json({ poll });
   } catch (error) {
@@ -178,11 +182,11 @@ router.post("/:slug/archive", requireVerifiedUser, limitWrites, async (request, 
 
 router.delete("/:slug", requireVerifiedUser, limitWrites, async (request, response, next) => {
   try {
-    const poll = await Poll.findOneAndUpdate(
+    const poll = await withIdentityTransaction(request.auth, (session) => Poll.findOneAndUpdate(
       ownerFilter(request),
       { $set: { status: "archived", deletedAt: new Date() } },
-      { returnDocument: "after" },
-    );
+      { returnDocument: "after", session },
+    ));
     if (!poll) return response.status(404).json({ message: "Poll not found" });
     return response.status(204).end();
   } catch (error) {
@@ -205,13 +209,15 @@ router.post("/:slug/reports", limitReports, async (request, response, next) => {
 
     const session = await readOptionalSession(request);
     const reporterKey = getVoterKey(request, response, session);
-    await Report.create({
+    const save = (transaction) => Report.create([{
       pollSlug: request.params.slug,
       reporterKey,
       reporterUserId: session?.user?.id || null,
       reason,
       details,
-    });
+    }], { session: transaction });
+    if (session?.user) await withIdentityTransaction(session, save);
+    else await save(null);
     return response.status(201).json({ message: "Report submitted for review" });
   } catch (error) {
     if (error?.code === 11000) {
@@ -245,7 +251,7 @@ router.post("/:slug/votes", limitWrites, async (request, response, next) => {
 
     const session = await readOptionalSession(request);
     const voterKey = getVoterKey(request, response, session);
-    return response.json(await recordVote({ pollSlug: request.params.slug, voterKey, optionId: optionId.toLowerCase() }));
+    return response.json(await recordVote({ pollSlug: request.params.slug, voterKey, optionId: optionId.toLowerCase(), identity: session }));
   } catch (error) {
     if (error instanceof VoteError) {
       return response.status(error.status).json({ message: error.message });
