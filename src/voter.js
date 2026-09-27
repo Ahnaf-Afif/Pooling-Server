@@ -2,6 +2,7 @@ import { createHmac, randomUUID, timingSafeEqual } from "node:crypto";
 
 const COOKIE_NAME = "wdyt_voter";
 const ONE_YEAR_SECONDS = 60 * 60 * 24 * 365;
+const anonymousIdentity = Symbol("anonymousVoter");
 
 export function getVoterSecret() {
   const configured = process.env.VOTER_SECRET?.trim();
@@ -56,7 +57,7 @@ function setVoterCookie(response, value) {
 export function getVoterKey(request, response, session) {
   const identity = session?.user?.id
     ? `user:${session.user.id}`
-    : `anonymous:${readSignedVoter(request) || createAnonymousVoter(response)}`;
+    : `anonymous:${request[anonymousIdentity] ||= readSignedVoter(request) || createAnonymousVoter(response)}`;
   return createHmac("sha256", getVoterSecret()).update(identity).digest("hex");
 }
 

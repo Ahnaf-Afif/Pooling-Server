@@ -10,7 +10,7 @@ import RecoveryRequest from "../models/RecoveryRequest.js";
 import AuthUser from "../models/AuthUser.js";
 import { approveRecovery } from "../services/account-recovery.js";
 import { paginateStaff, StaffPaginationError } from "../services/staff-pagination.js";
-import { limitWrites } from "../rate-limit.js";
+import { limitAccountReads, limitWrites } from "../rate-limit.js";
 import {
   findAuthUserById,
   idCandidates,
@@ -32,6 +32,7 @@ router.use((_request, response, next) => {
   next();
 });
 router.use(requireModerator);
+router.use(limitAccountReads);
 
 router.get("/recovery", requireAdmin, async (request, response, next) => {
   try {

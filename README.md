@@ -124,6 +124,51 @@ migration or deployment is implied by the local tests.
 
 Writes use MongoDB-backed rate limits across Vercel instances. Poll creation is limited per account and IP. Anonymous voting uses a signed HttpOnly first-party cookie and a unique database receipt; it prevents repeat votes from the same browser but remains a casual-poll model because cookies, devices, and networks can be changed.
 
+### Request protection
+
+The default limits below count attempts in fixed UTC-aligned windows, not rolling
+periods. Rejected/invalid attempts may consume an earlier network bucket. Limits
+are centralized in `src/rate-limit.js`; tune them using actual traffic and shared
+network measurements before expanding the audience.
+
+| Request group | Identity allowance | Network backstop |
+| --- | --- | --- |
+| API GET/HEAD | — | 600/minute |
+| API POST/PATCH/PUT/DELETE | Additional limits below | 300/minute, before authentication/body parsing |
+| Account, owner-list and staff reads | 120/account/minute | API read backstop |
+| Voting and other general application writes | 30/account or signed guest/minute | API write backstop |
+| Poll creation | 10/account/day | 100/day |
+| Reports | 5/account or signed guest/hour | 50/hour |
+| Account export | 3/account/hour | 30/hour |
+| Authenticator/recovery attempts | 10/account/15 minutes | 100/15 minutes |
+
+Better Auth retains its own additional authentication limits. Liveness is a cheap,
+database-independent route and bypasses these database-backed limits; readiness
+does not. Browsing and voting still do not require an account. Guest quotas use
+the existing signed first-party voter cookie, and a first vote creates only one
+identity shared by its limiter and receipt. Authenticated public writes resolve
+the real session before applying the participant allowance, so changing IPs does
+not reset the account quota. Different users on a shared IP get separate smaller
+allowances, subject to the larger shared network cap.
+
+Counters use atomic MongoDB increments and the existing rate-bucket TTL index.
+Each limiter instance caches at most 5,000 rejected bucket keys until their window
+ends. This avoids repeated counter writes for a known rejection without ever
+caching permission to proceed. Cold starts and cache eviction still consult
+MongoDB; they do not reset the shared allowance. Database errors fail closed with
+503 instead of allowing an unprotected operation. Responses use private/no-store
+and Retry-After for 429/503 protection failures. A new policy/key format can start
+fresh rate buckets on release; it does not change vote identities or receipts.
+
+This is application-level protection, not a DDoS or one-human/one-vote guarantee.
+Fixed-window boundaries permit bursts; cycling cookies/accounts/IPs remains
+possible. Network limits can still affect busy shared networks. Verify real client
+IP attribution on both Vercel paths (including forwarded-header spoofing and IPv6
+address rotation) before relying on network quotas. New identities and cold
+instances still cause database work, and authentication may run before some
+identity-specific limits. Edge/WAF controls, bot-provider approval, realistic
+load measurements and rate-limit alerting remain separate release requirements.
+
 Voting clients should load `my-vote` and preserve its cookie before the first
 submission. Its response contains only `optionId` (or null), uses `private,
 no-store`, and does not accept a caller-supplied account ID. A signed-in request

@@ -10,7 +10,7 @@ import Poll from "../models/Poll.js";
 import Report from "../models/Report.js";
 import RecoveryRequest from "../models/RecoveryRequest.js";
 import VoteReceipt from "../models/VoteReceipt.js";
-import { limitWrites } from "../rate-limit.js";
+import { limitAccountReads, limitExports, limitWrites } from "../rate-limit.js";
 import { getAccountVoterKey } from "../voter.js";
 import { assertAdminWillRemain, idCandidates, lockAdminChanges, UserAdminError } from "../services/user-admin.js";
 import { lockIdentity } from "../services/identity-transaction.js";
@@ -26,8 +26,9 @@ router.use((_request, response, next) => {
   next();
 });
 router.use(requireVerifiedUser);
+router.use(limitAccountReads);
 
-router.get("/export", requireRecentAuth, async (request, response, next) => {
+router.get("/export", requireRecentAuth, limitExports, async (request, response, next) => {
   try {
     const userId = request.auth.user.id;
     const voterKey = getAccountVoterKey(userId);

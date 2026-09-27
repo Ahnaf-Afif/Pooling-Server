@@ -4,7 +4,7 @@ import { auth } from "./auth.js";
 import { hasRecentVerification, isRecent, STAFF_SESSION_MS } from "./security-policy.js";
 
 export async function readSession(request) {
-  if (request.auth) return request.auth;
+  if (request.auth !== undefined) return request.auth;
   const session = await auth.api.getSession({
     headers: fromNodeHeaders(request.headers),
   });
@@ -13,9 +13,14 @@ export async function readSession(request) {
 }
 
 export async function readOptionalSession(request) {
-  if (request.auth) return request.auth;
+  if (request.auth !== undefined) return request.auth;
   if (!request.headers.cookie?.includes("better-auth")) return null;
   return readSession(request);
+}
+
+export async function identifyOptionalUser(request, _response, next) {
+  try { await readOptionalSession(request); return next(); }
+  catch (error) { return next(error); }
 }
 
 export async function requireVerifiedUser(request, response, next) {

@@ -14,6 +14,7 @@ import accountRoutes from "./routes/account.js";
 import securityRoutes from "./routes/security.js";
 import pollRoutes from "./routes/polls.js";
 import { IdentityError } from "./services/identity-transaction.js";
+import { limitReads, limitWriteNetwork } from "./rate-limit.js";
 
 export function createApp(clientOrigins = getClientOrigins()) {
   const app = express();
@@ -59,6 +60,7 @@ export function createApp(clientOrigins = getClientOrigins()) {
     }
   });
 
+  app.use("/api", limitReads, limitWriteNetwork);
   app.all("/api/auth/*splat", toNodeHandler(auth));
   app.use(express.json({ limit: "10kb" }));
 

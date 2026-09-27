@@ -7,7 +7,7 @@ import { requireRecentAuth, requireVerifiedUser } from "../auth-middleware.js";
 import AuthSession from "../models/AuthSession.js";
 import RateBucket from "../models/RateBucket.js";
 import RecoveryRequest from "../models/RecoveryRequest.js";
-import { limitSecurityAttempts, limitWrites } from "../rate-limit.js";
+import { limitAccountReads, limitSecurityAttempts, limitWrites } from "../rate-limit.js";
 import { hasRecentVerification, isRecent, isStaff, STAFF_SESSION_MS } from "../security-policy.js";
 import { idCandidates, UserAdminError } from "../services/user-admin.js";
 import { publicRecovery, replaceRecoveryCodes, requestRecovery } from "../services/account-recovery.js";
@@ -16,6 +16,7 @@ import { withIdentityTransaction } from "../services/identity-transaction.js";
 const router = Router();
 router.use((_request, response, next) => { response.set("Cache-Control", "private, no-store"); next(); });
 router.use(requireVerifiedUser);
+router.use(limitAccountReads);
 
 function sendError(error, response, next) {
   if (error instanceof UserAdminError) return response.status(error.status).json({ message: error.message });

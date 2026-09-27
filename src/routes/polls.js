@@ -1,12 +1,12 @@
 import { Router } from "express";
 import mongoose from "mongoose";
 
-import { readOptionalSession, requireVerifiedUser } from "../auth-middleware.js";
+import { identifyOptionalUser, readOptionalSession, requireVerifiedUser } from "../auth-middleware.js";
 import { CATEGORIES, TRENDING_MIN_VOTES, TRENDING_WINDOW_MS } from "../constants.js";
 import Poll from "../models/Poll.js";
 import Report from "../models/Report.js";
 import VoteReceipt from "../models/VoteReceipt.js";
-import { limitPollCreation, limitReports, limitWrites } from "../rate-limit.js";
+import { limitAccountReads, limitPollCreation, limitReports, limitWrites } from "../rate-limit.js";
 import { createSlug, validatePoll } from "../validation.js";
 import { getVoterKey } from "../voter.js";
 import { paginatePolls, PaginationError } from "../services/poll-pagination.js";
@@ -65,7 +65,7 @@ router.get("/", async (request, response, next) => {
   }
 });
 
-router.get("/mine", requireVerifiedUser, async (request, response, next) => {
+router.get("/mine", requireVerifiedUser, limitAccountReads, async (request, response, next) => {
   response.set("Cache-Control", "private, no-store");
   try {
     const result = await paginatePolls({
@@ -79,7 +79,7 @@ router.get("/mine", requireVerifiedUser, async (request, response, next) => {
   }
 });
 
-router.get("/mine/:slug", requireVerifiedUser, async (request, response, next) => {
+router.get("/mine/:slug", requireVerifiedUser, limitAccountReads, async (request, response, next) => {
   response.set("Cache-Control", "private, no-store");
   try {
     const poll = await Poll.findOne(ownerFilter(request));
@@ -194,7 +194,7 @@ router.delete("/:slug", requireVerifiedUser, limitWrites, async (request, respon
   }
 });
 
-router.post("/:slug/reports", limitReports, async (request, response, next) => {
+router.post("/:slug/reports", identifyOptionalUser, limitReports, async (request, response, next) => {
   try {
     const reason = typeof request.body?.reason === "string" ? request.body.reason.trim() : "";
     const details = typeof request.body?.details === "string" ? request.body.details.trim() : "";
@@ -241,7 +241,7 @@ router.get("/:slug/my-vote", async (request, response, next) => {
   } catch (error) { return next(error); }
 });
 
-router.post("/:slug/votes", limitWrites, async (request, response, next) => {
+router.post("/:slug/votes", identifyOptionalUser, limitWrites, async (request, response, next) => {
   response.set("Cache-Control", "private, no-store");
   try {
     const optionId = request.body?.optionId;

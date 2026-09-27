@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { after, before, beforeEach, test } from "node:test";
 import { ObjectId } from "mongodb";
 import { makeSignature, symmetricDecrypt, symmetricEncrypt } from "better-auth/crypto";
@@ -1173,4 +1174,111 @@ test("identity revision writes roll back when the poll insert fails", async () =
     assert.equal((await database.collection("user").findOne({ _id: user._id })).securityRevision, undefined);
     assert.equal((await database.collection("session").findOne({ userId: { $in: [user.id, user._id] } })).securityRevision, undefined);
   } finally { Poll.create = original; }
+});
+
+async function fillRateBucket(prefix, identity, windowMs, count) {
+  const start = Math.floor(Date.now() / windowMs) * windowMs;
+  // Include the next window so an actual clock boundary cannot make a test flaky.
+  for (const windowStart of [start, start + windowMs]) {
+    await database.collection("ratebuckets").updateOne(
+      { _id: `${prefix}:${createHash("sha256").update(identity).digest("hex")}:${windowStart}` },
+      { $set: { count, expiresAt: new Date(windowStart + windowMs * 2) } }, { upsert: true },
+    );
+  }
+}
+
+test("public read limits cover GET and HEAD, preserve liveness and do not leak cached denials", async () => {
+  const address = "198.51.100.10";
+  await fillRateBucket("read", `ip:${address}`, 60_000, 600);
+  for (const method of ["GET", "HEAD"]) {
+    const response = await fetch(`${baseUrl}/api/polls?stats=false`, { method, headers: { "X-Forwarded-For": address } });
+    assert.equal(response.status, 429);
+    assert.equal(response.headers.get("cache-control"), "private, no-store");
+    assert.ok(Number(response.headers.get("retry-after")) > 0);
+  }
+  assert.equal((await fetch(`${baseUrl}/api/health/live`, { headers: { "X-Forwarded-For": address } })).status, 200);
+  assert.equal((await fetch(`${baseUrl}/api/polls?stats=false`, { headers: { "X-Forwarded-For": "198.51.100.11" } })).status, 200);
+});
+
+test("account export quota follows the account across networks and leaves other accounts available", async () => {
+  const user = await createUser();
+  const other = await createUser();
+  for (let index = 0; index < 3; index += 1) {
+    const response = await fetch(`${baseUrl}/api/account/export`, { headers: { Cookie: user.cookie, "X-Forwarded-For": `198.51.100.${20 + index}` } });
+    assert.equal(response.status, 200, await response.text());
+  }
+  // Pin a full bucket even if the three exports crossed an hourly boundary.
+  await fillRateBucket("export", `user:${user.id}`, 3_600_000, 3);
+  const denied = await fetch(`${baseUrl}/api/account/export`, { headers: { Cookie: user.cookie, "X-Forwarded-For": "198.51.100.25" } });
+  assert.equal(denied.status, 429);
+  assert.equal(denied.headers.get("cache-control"), "private, no-store");
+  const allowed = await fetch(`${baseUrl}/api/account/export`, { headers: { Cookie: other.cookie, "X-Forwarded-For": "198.51.100.25" } });
+  assert.equal(allowed.status, 200);
+  assert.equal((await allowed.json()).account.id, other.id);
+});
+
+test("voting and reporting identify the real account before consuming participant quotas", async () => {
+  const { getAccountVoterKey } = await import("../src/voter.js");
+  const user = await createUser();
+  const other = await createUser();
+  const poll = await createPoll();
+  const participant = `voter:${getAccountVoterKey(user.id)}`;
+  await fillRateBucket("write", participant, 60_000, 30);
+  await fillRateBucket("report", participant, 3_600_000, 5);
+  const send = (action, cookie, address) => fetch(`${baseUrl}/api/polls/${poll.slug}/${action}`, {
+    method: "POST", headers: { Cookie: cookie, "Content-Type": "application/json", "X-Forwarded-For": address },
+    body: JSON.stringify(action === "votes" ? { optionId: String(poll.options[0]._id) } : { reason: "spam" }),
+  });
+  for (const action of ["votes", "reports"]) {
+    assert.equal((await send(action, user.cookie, "198.51.100.30")).status, 429);
+    assert.equal((await send(action, user.cookie, "198.51.100.31")).status, 429);
+  }
+  assert.equal(await VoteReceipt.countDocuments({}), 0);
+  assert.equal(await Report.countDocuments({}), 0);
+  assert.equal((await send("votes", other.cookie, "198.51.100.31")).status, 200);
+  assert.equal((await send("reports", other.cookie, "198.51.100.31")).status, 201);
+  assert.equal((await Poll.findById(poll._id)).totalVotes, 1);
+});
+
+test("first guest submission uses the same signed identity for its limiter and receipt", async () => {
+  const poll = await createPoll();
+  const result = await post(`/api/polls/${poll.slug}/votes`, null, { optionId: String(poll.options[0]._id) });
+  assert.equal(result.status, 200, await result.clone().text());
+  const cookies = result.headers.getSetCookie().filter((cookie) => cookie.startsWith("wdyt_voter="));
+  assert.equal(cookies.length, 1);
+  const cookie = cookies[0].split(";", 1)[0];
+  const lookup = await fetch(`${baseUrl}/api/polls/${poll.slug}/my-vote`, { headers: { Cookie: cookie } });
+  assert.equal((await lookup.json()).optionId, String(poll.options[0]._id));
+  const receipt = await VoteReceipt.findOne({ pollSlug: poll.slug }).lean();
+  const digest = createHash("sha256").update(`voter:${receipt.voterKey}`).digest("hex");
+  assert.equal(await database.collection("ratebuckets").countDocuments({ _id: { $regex: `^write:${digest}:` }, count: 1 }), 1);
+});
+
+test("independent limiter instances enforce one shared allowance under concurrent MongoDB writes", async () => {
+  const { createLimiter } = await import("../src/rate-limit.js");
+  const timestamp = Date.now();
+  const options = { prefix: "concurrency-test", windowMs: 60_000, rules: [{ key: () => "one-identity", max: 7 }],
+    message: "Slow down", cacheSize: 0, now: () => timestamp };
+  const instances = [createLimiter(options), createLimiter(options)];
+  const statuses = await Promise.all(Array.from({ length: 40 }, async (_, index) => {
+    const response = { statusCode: 200, set() {}, status(code) { this.statusCode = code; return this; }, json() {} };
+    await instances[index % 2]({}, response, () => {});
+    return response.statusCode;
+  }));
+  assert.equal(statuses.filter((status) => status === 200).length, 7);
+  assert.equal(statuses.filter((status) => status === 429).length, 33);
+  assert.equal(await database.collection("ratebuckets").countDocuments({ _id: /^concurrency-test:/ }), 1);
+  assert.equal((await database.collection("ratebuckets").findOne({ _id: /^concurrency-test:/ })).count, 40);
+});
+
+test("network write rejection runs before JSON parsing or guest identity allocation", async () => {
+  const address = "198.51.100.50";
+  await fillRateBucket("write-network", `ip:${address}`, 60_000, 300);
+  const response = await fetch(`${baseUrl}/api/polls/anything/votes`, {
+    method: "POST", headers: { "Content-Type": "application/json", "X-Forwarded-For": address }, body: "invalid-json",
+  });
+  assert.equal(response.status, 429);
+  assert.equal(response.headers.get("set-cookie"), null);
+  assert.equal(await VoteReceipt.countDocuments({}), 0);
+  assert.equal(await database.collection("ratebuckets").countDocuments({ _id: /^write:/ }), 0);
 });
