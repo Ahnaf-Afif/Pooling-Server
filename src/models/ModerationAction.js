@@ -15,6 +15,7 @@ const moderationActionSchema = new mongoose.Schema(
         "user_suspended",
         "user_reactivated",
         "role_changed",
+        "factor_recovered",
       ],
       index: true,
     },

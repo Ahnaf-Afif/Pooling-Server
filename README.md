@@ -107,7 +107,9 @@ Run `npm run db:indexes` to inspect proposed indexes, then `npm run db:indexes -
 
 Staff must enroll an authenticator from **Account → Account security**, save the recovery codes privately, and verify a code before accessing staff tools. Staff access requires a session created within 12 hours; moderation writes require factor verification within 15 minutes. Google sign-in alone does not meet this requirement. Ordinary login is not itself gated by the authenticator.
 
-Account security lists signed-in devices without exposing session tokens. Revoking other devices and deleting an account require recent authentication (or recent factor verification when enabled). Staff cannot disable their authenticator. Select and test a second recovery administrator before launch; lost-factor recovery and recovery-code regeneration still need an operational workflow.
+Account security lists signed-in devices without exposing session tokens. Revoking other devices and deleting an account require recent authentication (or recent factor verification when enabled). Staff cannot disable their authenticator. Recovery codes can be replaced after verification, invalidating old codes and revoking other sessions. Lost-factor recovery requires a fresh sign-in and independent approval by another MFA-verified administrator; it is transactional and audited. See [STAFF-RECOVERY.md](STAFF-RECOVERY.md). Select and test a second recovery administrator before launch. Recovery notifications are currently manual.
+
+The recovery release additionally requires index migration `2026-09-account-recovery-v5`; it includes all previously declared indexes. Request records expire after 24 hours. Apply and verify indexes before promoting this backend and its matching account/admin UI.
 
 Suspending a poll owner revokes their sessions but deliberately leaves content reports pending. Staff must separately edit/remove the content or dismiss the report. Reports for content already removed can be resolved with an audit reason.
 

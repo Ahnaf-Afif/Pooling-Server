@@ -6,9 +6,13 @@ import { withDatabaseTransaction } from "../db.js";
 import ModerationAction from "../models/ModerationAction.js";
 import Poll from "../models/Poll.js";
 import Report from "../models/Report.js";
+import RecoveryRequest from "../models/RecoveryRequest.js";
+import AuthUser from "../models/AuthUser.js";
+import { approveRecovery } from "../services/account-recovery.js";
 import { limitWrites } from "../rate-limit.js";
 import {
   findAuthUserById,
+  idCandidates,
   listAuthUsers,
   reactivateAuthUser,
   setAuthUserRole,
@@ -28,6 +32,34 @@ router.use((_request, response, next) => {
   next();
 });
 router.use(requireModerator);
+
+router.get("/recovery", requireAdmin, async (request, response, next) => {
+  try {
+    const after = request.query.after;
+    if (after !== undefined && (typeof after !== "string" || !/^[a-zA-Z0-9-]{1,80}$/.test(after))) return response.status(400).json({ message: "Invalid recovery cursor" });
+    const rows = await RecoveryRequest.find({ status: "pending", expiresAt: { $gt: new Date() }, ...(after ? { _id: { $gt: after } } : {}) })
+      .sort({ _id: 1 }).limit(26).maxTimeMS(5000).lean();
+    const requests = rows.slice(0, 25);
+    const users = await AuthUser.find({ _id: { $in: requests.flatMap((row) => idCandidates(row._id)) } }).select("name email").lean();
+    const names = new Map(users.map((user) => [String(user._id), user]));
+    return response.json({ requests: requests.map((row) => ({
+      userId: row._id, requestId: row.requestId, createdAt: row.createdAt, expiresAt: row.expiresAt,
+      name: names.get(row._id)?.name || "Unavailable account", email: names.get(row._id)?.email || "",
+      self: row._id === request.auth.user.id,
+    })), nextCursor: rows.length > 25 ? requests.at(-1)._id : null });
+  } catch (error) { return next(error); }
+});
+
+router.post("/recovery/:id/approve", requireAdmin, limitWrites, async (request, response, next) => {
+  try {
+    const { note, error } = cleanNote(request.body, { required: true, minimum: 10 });
+    if (error || request.body?.identityConfirmed !== true || !/^[a-f0-9-]{36}$/.test(request.params.id)) {
+      return response.status(400).json({ message: error || "Independently verify the account owner and confirm the recovery request" });
+    }
+    const result = await approveRecovery(request.auth, request.params.id, note);
+    return response.json({ ...result, message: "Recovery approved. The owner must sign in again and enroll a new authenticator before using staff tools." });
+  } catch (error) { return sendAdminError(error, response, next); }
+});
 
 class ModerationRequestError extends Error {
   constructor(message, status = 400) {

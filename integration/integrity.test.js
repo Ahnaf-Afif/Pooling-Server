@@ -576,3 +576,189 @@ test("simultaneous conflicting choices accept only one immutable vote", async ()
   assert.equal(saved.options.reduce((sum, option) => sum + option.votes, 0), 1);
   assert.equal(await VoteReceipt.countDocuments({ pollSlug: poll.slug }), 1);
 });
+
+async function enrollFactor(user) {
+  const enrollment = await post("/api/account/security/enable", user.cookie);
+  assert.equal(enrollment.status, 200, await enrollment.clone().text());
+  const { backupCodes } = await enrollment.json();
+  const { idCandidates } = await import("../src/services/user-admin.js");
+  const record = await database.collection("twoFactor").findOne({ userId: { $in: idCandidates(user.id) } });
+  const context = await auth.$context;
+  const code = await createOTP(await symmetricDecrypt({ key: context.secretConfig, data: record.secret })).totp();
+  const verified = await post("/api/account/security/verify", user.cookie, { code });
+  assert.equal(verified.status, 200, await verified.clone().text());
+  user.cookie = updatedCookie(verified, user.cookie);
+  return backupCodes;
+}
+
+async function startRecovery(user) {
+  const result = await post("/api/account/security/recovery", user.cookie, { confirmation: "RECOVER" });
+  assert.equal(result.status, 200, await result.clone().text());
+  return (await result.json()).recovery;
+}
+
+const approveBody = { identityConfirmed: true, note: "Verified in person through a previously established contact." };
+
+test("replacement recovery codes are encrypted, single-use and consume one session-scoped verification", async () => {
+  const user = await createUser("admin");
+  const previous = await enrollFactor(user);
+  const context = await auth.$context;
+  await context.internalAdapter.createSession(user.id, false);
+  const responses = await Promise.all(Array.from({ length: 2 }, () => post("/api/account/security/recovery-codes", user.cookie, { confirmation: "REPLACE" })));
+  assert.deepEqual(responses.map((response) => response.status).sort(), [200, 403]);
+  const result = await responses.find((response) => response.status === 200).json();
+  assert.equal(result.backupCodes.length, 10);
+  assert.equal(new Set(result.backupCodes).size, 10);
+  const factor = await database.collection("twoFactor").findOne({});
+  assert.ok(!factor.backupCodes.includes(result.backupCodes[0]));
+  assert.deepEqual(JSON.parse(await symmetricDecrypt({ key: context.secretConfig, data: factor.backupCodes })), result.backupCodes);
+  assert.equal(await database.collection("session").countDocuments({}), 1);
+  assert.equal((await post("/api/account/security/verify", user.cookie, { code: previous[0], backup: true })).status, 401);
+  assert.equal((await post("/api/account/security/verify", user.cookie, { code: result.backupCodes[0], backup: true })).status, 200);
+  assert.equal((await post("/api/account/security/verify", user.cookie, { code: result.backupCodes[0], backup: true })).status, 401);
+});
+
+test("lost-factor requests require fresh sign-in, not possession of the lost factor, and can be cancelled", async () => {
+  const user = await createUser("moderator");
+  await enrollFactor(user);
+  await database.collection("session").updateMany({}, { $unset: { mfaVerifiedAt: "" }, $set: { createdAt: new Date(Date.now() - 16 * 60_000) } });
+  assert.equal((await post("/api/account/security/recovery", user.cookie, { confirmation: "RECOVER" })).status, 403);
+  await database.collection("session").updateMany({}, { $set: { createdAt: new Date() } });
+  const recovery = await startRecovery(user);
+  assert.deepEqual(await startRecovery(user), recovery);
+  assert.equal(await database.collection("recoveryrequests").countDocuments({}), 1);
+  const status = await fetch(`${baseUrl}/api/account/security`, { headers: { Cookie: user.cookie } });
+  const body = await status.json();
+  assert.deepEqual(body.recovery, recovery);
+  assert.equal(body.verified, false);
+  assert.equal(JSON.stringify(body).includes("factorFingerprint"), false);
+  assert.equal((await post("/api/account/security/recovery/cancel", user.cookie)).status, 200);
+  assert.equal(await database.collection("recoveryrequests").countDocuments({}), 0);
+  assert.equal(await database.collection("twoFactor").countDocuments({}), 1);
+});
+
+test("only another freshly verified administrator can approve recovery, preserving roles and revoking every target session", async () => {
+  const target = await createUser("admin");
+  await enrollFactor(target);
+  const recovery = await startRecovery(target);
+  const path = `/api/moderation/recovery/${recovery.requestId}/approve`;
+  assert.equal((await post(path, target.cookie, approveBody)).status, 403);
+  const moderator = await createUser("moderator");
+  await enrollFactor(moderator);
+  assert.equal((await post(path, moderator.cookie, approveBody)).status, 403);
+  const administrator = await createUser("admin");
+  assert.equal((await post(path, administrator.cookie, approveBody)).status, 403);
+  await enrollFactor(administrator);
+  assert.equal((await post(path, administrator.cookie, { note: approveBody.note })).status, 400);
+  const listing = await fetch(`${baseUrl}/api/moderation/recovery`, { headers: { Cookie: administrator.cookie } });
+  const listed = await listing.json();
+  assert.equal(listed.requests[0].requestId, recovery.requestId);
+  assert.equal(JSON.stringify(listed).includes("factorFingerprint"), false);
+  const response = await post(path, administrator.cookie, approveBody);
+  assert.equal(response.status, 200, await response.clone().text());
+  const updated = await database.collection("user").findOne({ _id: target._id });
+  assert.equal(updated.role, "admin");
+  assert.equal(updated.twoFactorEnabled, false);
+  const { idCandidates } = await import("../src/services/user-admin.js");
+  assert.equal(await database.collection("session").countDocuments({ userId: { $in: idCandidates(target.id) } }), 0);
+  assert.equal((await post("/api/account/security/verify", target.cookie, { code: "123456" })).status, 401);
+  assert.equal(await ModerationAction.countDocuments({ action: "factor_recovered", targetUserId: target.id }), 1);
+  // A successful retry must not reset a newly enrolled factor.
+  const context = await auth.$context;
+  const fresh = await context.internalAdapter.createSession(target.id, false);
+  target.cookie = `better-auth.session_token=${encodeURIComponent(`${fresh.token}.${await makeSignature(fresh.token, secret)}`)}`;
+  const queue = await fetch(`${baseUrl}/api/moderation/reports`, { headers: { Cookie: target.cookie } });
+  assert.equal(queue.status, 403);
+  await enrollFactor(target);
+  const replay = await post(path, administrator.cookie, approveBody);
+  assert.equal(replay.status, 200);
+  assert.equal((await replay.json()).replayed, true);
+  assert.equal((await database.collection("user").findOne({ _id: target._id })).twoFactorEnabled, true);
+  assert.equal(await ModerationAction.countDocuments({ action: "factor_recovered" }), 1);
+});
+
+test("recovery approval rolls back every change when its audit fails and rejects expired or changed factors", async () => {
+  const target = await createUser("moderator");
+  await enrollFactor(target);
+  const administrator = await createUser("admin");
+  await enrollFactor(administrator);
+  const recovery = await startRecovery(target);
+  const path = `/api/moderation/recovery/${recovery.requestId}/approve`;
+  const originalCreate = ModerationAction.create;
+  try {
+    ModerationAction.create = async () => { throw new Error("Injected recovery audit failure"); };
+    assert.equal((await post(path, administrator.cookie, approveBody)).status, 500);
+  } finally { ModerationAction.create = originalCreate; }
+  assert.equal((await database.collection("user").findOne({ _id: target._id })).twoFactorEnabled, true);
+  assert.equal(await database.collection("twoFactor").countDocuments({}), 2);
+  assert.equal((await database.collection("recoveryrequests").findOne({ _id: target.id })).status, "pending");
+  const { idCandidates } = await import("../src/services/user-admin.js");
+  await database.collection("twoFactor").updateOne({ userId: { $in: idCandidates(target.id) } }, { $set: { secret: "changed-factor-for-test" } });
+  assert.equal((await post(path, administrator.cookie, approveBody)).status, 409);
+  await database.collection("recoveryrequests").updateOne({ _id: target.id }, { $set: { expiresAt: new Date(0) } });
+  assert.equal((await post(path, administrator.cookie, approveBody)).status, 404);
+});
+
+test("recovery code replacement rolls back ciphertext and session revocation together", async () => {
+  const user = await createUser();
+  const previous = await enrollFactor(user);
+  const context = await auth.$context;
+  await context.internalAdapter.createSession(user.id, false);
+  const { default: RecoveryRequest } = await import("../src/models/RecoveryRequest.js");
+  const original = RecoveryRequest.deleteOne;
+  try {
+    RecoveryRequest.deleteOne = async () => { throw new Error("Injected recovery cancellation failure"); };
+    assert.equal((await post("/api/account/security/recovery-codes", user.cookie, { confirmation: "REPLACE" })).status, 500);
+  } finally { RecoveryRequest.deleteOne = original; }
+  assert.equal(await database.collection("session").countDocuments({}), 2);
+  assert.equal((await post("/api/account/security/verify", user.cookie, { code: previous[0], backup: true })).status, 200);
+});
+
+test("simultaneous recovery approvals produce exactly one factor reset and audit record", async () => {
+  const target = await createUser();
+  await enrollFactor(target);
+  const recovery = await startRecovery(target);
+  const administrators = [await createUser("admin"), await createUser("admin")];
+  for (const administrator of administrators) await enrollFactor(administrator);
+  const responses = await Promise.all(administrators.map((administrator) => post(`/api/moderation/recovery/${recovery.requestId}/approve`, administrator.cookie, approveBody)));
+  assert.deepEqual(responses.map((response) => response.status), [200, 200]);
+  const results = await Promise.all(responses.map((response) => response.json()));
+  assert.deepEqual(results.map((result) => result.replayed).sort(), [false, true]);
+  assert.equal(await ModerationAction.countDocuments({ action: "factor_recovered" }), 1);
+});
+
+test("recovery queue is paginated, excludes expired requests and rejects stale approval proof", async () => {
+  const administrator = await createUser("admin");
+  await enrollFactor(administrator);
+  const { default: RecoveryRequest } = await import("../src/models/RecoveryRequest.js");
+  const { randomUUID } = await import("node:crypto");
+  await RecoveryRequest.insertMany(Array.from({ length: 28 }, (_, index) => ({
+    _id: `user-${String(index).padStart(2, "0")}`, requestId: randomUUID(), status: "pending", factorFingerprint: "test-only",
+    createdAt: new Date(), expiresAt: new Date(Date.now() + (index === 27 ? -1000 : 86_400_000)),
+  })));
+  const getQueue = (suffix = "") => fetch(`${baseUrl}/api/moderation/recovery${suffix}`, { headers: { Cookie: administrator.cookie } });
+  const first = await (await getQueue()).json();
+  assert.equal(first.requests.length, 25);
+  const second = await (await getQueue(`?after=${first.nextCursor}`)).json();
+  assert.equal(second.requests.length, 2);
+  assert.equal(second.nextCursor, null);
+  assert.equal(new Set([...first.requests, ...second.requests].map((row) => row.userId)).size, 27);
+  assert.equal((await getQueue("?after=invalid%20cursor")).status, 400);
+  await database.collection("session").updateMany({}, { $set: { mfaVerifiedAt: new Date(Date.now() - 16 * 60_000) } });
+  assert.equal((await post(`/api/moderation/recovery/${first.requests[0].requestId}/approve`, administrator.cookie, approveBody)).status, 403);
+});
+
+test("account export omits recovery fingerprints and deletion clears recovery ownership", async () => {
+  const user = await createUser();
+  await enrollFactor(user);
+  const recovery = await startRecovery(user);
+  const exported = await fetch(`${baseUrl}/api/account/export`, { headers: { Cookie: user.cookie } });
+  assert.equal(exported.status, 200);
+  const body = await exported.json();
+  assert.equal(body.recoveryRequest.requestId, recovery.requestId);
+  assert.equal(JSON.stringify(body).includes("factorFingerprint"), false);
+  await database.collection("recoveryrequests").insertOne({ _id: "another-owner", requestId: "another-request", approvedBy: user.id });
+  assert.equal((await post("/api/account/delete", user.cookie, { confirmation: "DELETE" })).status, 204);
+  assert.equal(await database.collection("recoveryrequests").findOne({ _id: user.id }), null);
+  assert.equal((await database.collection("recoveryrequests").findOne({ _id: "another-owner" })).approvedBy, null);
+});

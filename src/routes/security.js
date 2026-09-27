@@ -6,15 +6,18 @@ import { auth } from "../auth.js";
 import { requireRecentAuth, requireVerifiedUser } from "../auth-middleware.js";
 import AuthSession from "../models/AuthSession.js";
 import RateBucket from "../models/RateBucket.js";
+import RecoveryRequest from "../models/RecoveryRequest.js";
 import { limitSecurityAttempts, limitWrites } from "../rate-limit.js";
 import { hasRecentVerification, isRecent, isStaff, STAFF_SESSION_MS } from "../security-policy.js";
-import { idCandidates } from "../services/user-admin.js";
+import { idCandidates, UserAdminError } from "../services/user-admin.js";
+import { publicRecovery, replaceRecoveryCodes, requestRecovery } from "../services/account-recovery.js";
 
 const router = Router();
 router.use((_request, response, next) => { response.set("Cache-Control", "private, no-store"); next(); });
 router.use(requireVerifiedUser);
 
 function sendError(error, response, next) {
+  if (error instanceof UserAdminError) return response.status(error.status).json({ message: error.message });
   if (error.statusCode >= 400 && error.statusCode < 500) {
     return response.status(error.statusCode).json({ message: error.body?.message || "Security verification failed" });
   }
@@ -30,13 +33,40 @@ function forwardCookies(headers, response) {
   return value.slice(0, value.lastIndexOf("."));
 }
 
-router.get("/", (request, response) => {
-  response.json({
-    enabled: Boolean(request.auth.user.twoFactorEnabled),
-    staff: isStaff(request.auth.user),
-    verified: hasRecentVerification(request.auth),
-    staffSessionExpired: !isRecent(request.auth.session.createdAt, STAFF_SESSION_MS),
-  });
+router.get("/", async (request, response, next) => {
+  try {
+    const recovery = await RecoveryRequest.findOne({ _id: request.auth.user.id, expiresAt: { $gt: new Date() } }).lean();
+    response.json({
+      enabled: Boolean(request.auth.user.twoFactorEnabled),
+      staff: isStaff(request.auth.user),
+      verified: hasRecentVerification(request.auth),
+      staffSessionExpired: !isRecent(request.auth.session.createdAt, STAFF_SESSION_MS),
+      recovery: publicRecovery(recovery),
+    });
+  } catch (error) { next(error); }
+});
+
+router.post("/recovery-codes", requireRecentAuth, limitSecurityAttempts, async (request, response, next) => {
+  if (request.body?.confirmation !== "REPLACE") return response.status(400).json({ message: "Confirm replacement of existing recovery codes" });
+  try {
+    const backupCodes = await replaceRecoveryCodes(request.auth);
+    return response.json({ backupCodes, message: "Recovery codes replaced. Old codes no longer work and other devices are signed out. Save these codes now, then verify again for sensitive actions." });
+  } catch (error) { return sendError(error, response, next); }
+});
+
+router.post("/recovery", limitSecurityAttempts, async (request, response, next) => {
+  if (request.body?.confirmation !== "RECOVER") return response.status(400).json({ message: "Confirm that you need authenticator recovery" });
+  try {
+    const recovery = await requestRecovery(request.auth);
+    return response.json({ recovery, message: "Request recorded for 24 hours. Contact a known administrator with this reference; no notification is sent automatically. Your authenticator stays enabled until independent verification and approval." });
+  } catch (error) { return sendError(error, response, next); }
+});
+
+router.post("/recovery/cancel", limitSecurityAttempts, async (request, response, next) => {
+  try {
+    await RecoveryRequest.deleteOne({ _id: request.auth.user.id, status: "pending" });
+    return response.json({ message: "Pending recovery request cancelled" });
+  } catch (error) { return next(error); }
 });
 
 router.post("/enable", requireRecentAuth, limitSecurityAttempts, async (request, response, next) => {
