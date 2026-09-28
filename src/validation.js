@@ -5,7 +5,7 @@ import { CATEGORIES } from "./constants.js";
 const normalizeText = (value) =>
   typeof value === "string" ? value.trim().replace(/\s+/g, " ") : "";
 
-export function validatePoll(input = {}) {
+export function validatePoll(input = {}, { editing = false } = {}) {
   if (!input || typeof input !== "object" || Array.isArray(input)) input = {};
   const question = normalizeText(input.question);
   const category = normalizeText(input.category);
@@ -28,8 +28,14 @@ export function validatePoll(input = {}) {
     errors.push("Options must be unique");
   }
 
-  return { errors, value: { question, category, options } };
+  if (editing && (!Number.isSafeInteger(input.expectedRevision) || input.expectedRevision < 0 || input.expectedRevision >= Number.MAX_SAFE_INTEGER)) {
+    errors.push("Reload the poll before editing; a valid content revision is required");
+  }
+  return { errors, value: { question, category, options, ...(editing ? { expectedRevision: input.expectedRevision } : {}) } };
 }
+
+// Older documents have no revision field. Their first guarded edit writes 1.
+export const contentRevisionFilter = (revision) => ({ contentRevision: revision === 0 ? { $in: [0, null] } : revision });
 
 export function createSlug(question) {
   const base = question

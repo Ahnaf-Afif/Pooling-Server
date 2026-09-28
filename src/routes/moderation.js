@@ -20,7 +20,7 @@ import {
   suspendAuthUser,
   UserAdminError,
 } from "../services/user-admin.js";
-import { validatePoll } from "../validation.js";
+import { contentRevisionFilter, validatePoll } from "../validation.js";
 
 const router = Router();
 const REPORT_STATUSES = ["pending", "resolved", "dismissed"];
@@ -63,10 +63,11 @@ router.post("/recovery/:id/approve", requireAdmin, limitWrites, async (request, 
 });
 
 class ModerationRequestError extends Error {
-  constructor(message, status = 400) {
+  constructor(message, status = 400, code) {
     super(message);
     this.name = "ModerationRequestError";
     this.status = status;
+    this.code = code;
   }
 }
 
@@ -168,6 +169,7 @@ function serializePoll(poll) {
     deleted: Boolean(poll.deletedAt),
     moderatedAt: poll.moderatedAt || null,
     moderationEditCount: poll.moderationEditCount || 0,
+    contentRevision: poll.contentRevision || 0,
   };
 }
 
@@ -184,6 +186,7 @@ function pollSnapshot(poll) {
     totalVotes: poll.totalVotes,
     status: poll.status || "active",
     deletedAt: poll.deletedAt || null,
+    contentRevision: poll.contentRevision || 0,
   };
 }
 
@@ -192,6 +195,9 @@ function withSession(query, session) {
 }
 
 async function updatePollContent(poll, value, session) {
+  if ((poll.contentRevision || 0) !== value.expectedRevision) {
+    throw new ModerationRequestError("This poll was edited after you opened it. Your draft has not been saved. Reload the latest version before editing again.", 409, "POLL_CHANGED");
+  }
   const oldLabels = poll.options.map((option) => option.label);
   const changedFields = [];
   if (poll.question !== value.question) changedFields.push("question");
@@ -213,7 +219,7 @@ async function updatePollContent(poll, value, session) {
       ? { _id: existing._id, label, votes: existing.votes }
       : { label, votes: 0 };
   });
-  const concurrencyFilter = { _id: poll._id, deletedAt: null };
+  const concurrencyFilter = { _id: poll._id, deletedAt: null, ...contentRevisionFilter(value.expectedRevision) };
   if (poll.updatedAt) concurrencyFilter.updatedAt = poll.updatedAt;
   const updatedPoll = await Poll.findOneAndUpdate(
     concurrencyFilter,
@@ -223,6 +229,7 @@ async function updatePollContent(poll, value, session) {
         category: value.category,
         options,
         moderatedAt: new Date(),
+        contentRevision: value.expectedRevision + 1,
       },
       $inc: { moderationEditCount: 1 },
     },
@@ -238,7 +245,7 @@ function sendAdminError(error, response, next) {
     return response.status(409).json({ message: "A pending report from this reporter already exists. Review that report before reopening this one." });
   }
   if (error instanceof UserAdminError || error instanceof ModerationRequestError) {
-    return response.status(error.status).json({ message: error.message });
+    return response.status(error.status).json({ message: error.message, ...(error.code ? { code: error.code } : {}) });
   }
   return next(error);
 }
@@ -301,7 +308,7 @@ router.patch("/polls/:slug", limitWrites, async (request, response, next) => {
   try {
     const { note, error } = cleanNote(request.body, { required: true, minimum: 3 });
     if (error) return response.status(400).json({ message: error });
-    const { errors, value } = validatePoll(request.body);
+    const { errors, value } = validatePoll(request.body, { editing: true });
     if (errors.length) return response.status(400).json({ message: errors[0], errors });
     const result = await withStaffTransaction(request, async (session, actor) => {
       const poll = await withSession(
@@ -440,7 +447,7 @@ router.patch("/reports/:id/poll", limitWrites, async (request, response, next) =
   try {
     const { note, error } = cleanNote(request.body, { required: true, minimum: 3 });
     if (error) return response.status(400).json({ message: error });
-    const { errors, value } = validatePoll(request.body);
+    const { errors, value } = validatePoll(request.body, { editing: true });
     if (errors.length) return response.status(400).json({ message: errors[0], errors });
     const affectedReports = await withStaffTransaction(request, async (session, actor) => {
       const report = await findReport(request.params.id, { pending: true, session });

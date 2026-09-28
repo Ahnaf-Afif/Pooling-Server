@@ -195,7 +195,7 @@ test("a failed staff receipt insert rolls back both content changes and their au
   const { default: Receipt } = await import("../src/models/CommandReceipt.js");
   const create = Receipt.create;
   const path = `/api/moderation/polls/${poll.slug}`;
-  const body = { ...pollInput, category: "Food", note: "Correct the category" };
+  const body = { ...pollInput, category: "Food", note: "Correct the category", expectedRevision: 0 };
   try {
     Receipt.create = async () => { throw new Error("Injected staff receipt failure"); };
     assert.equal((await command(path, staff, "moderation-command-rollback", body, "PATCH")).status, 500);
@@ -253,11 +253,11 @@ test("every moderation command mapping replays without repeating its changes or 
   const report = await Report.create({ pollSlug: poll.slug, reporterKey: "mapping-reporter", reason: "spam" });
   const reportPath = `/api/moderation/reports/${report.id}`;
   const commands = [
-    [`/api/moderation/polls/${poll.slug}`, "PATCH", { question: poll.question, category: "Food", options: ["One", "Two"], note: "Correct the poll category" }],
+    [`/api/moderation/polls/${poll.slug}`, "PATCH", { question: poll.question, category: "Food", options: ["One", "Two"], note: "Correct the poll category", expectedRevision: 0 }],
     [reportPath, "PATCH", { status: "dismissed", note: "No content violation found" }],
     [`${reportPath}/notes`, "POST", { note: "Keep the review context" }],
     [reportPath, "PATCH", { status: "pending", note: "Reopen for content review" }],
-    [`${reportPath}/poll`, "PATCH", { question: poll.question, category: "Tech", options: ["One", "Two"], note: "Correct the category again" }],
+    [`${reportPath}/poll`, "PATCH", { question: poll.question, category: "Tech", options: ["One", "Two"], note: "Correct the category again", expectedRevision: 1 }],
     [reportPath, "PATCH", { status: "pending", note: "New policy evidence received" }],
     [`${reportPath}/suspend-owner`, "POST", { note: "Repeated policy violations" }],
     [`${reportPath}/remove-poll`, "POST", { note: "Remove the reported content" }],
@@ -324,6 +324,85 @@ test("a browser command cannot silently switch accounts between preparation and 
   assert.equal(response.status, 409);
   assert.equal((await response.json()).code, "ACCOUNT_CHANGED");
   assert.equal(await Poll.countDocuments({}), 0);
+});
+
+test("owner and staff editors reject stale drafts without overwriting newer content or creating audits", async () => {
+  const owner = await createUser();
+  const staff = await createUser("moderator");
+  await enrollFactor(staff);
+  const poll = await createPoll(owner.id);
+  const ownerPath = `/api/polls/${poll.slug}`;
+  const staffPath = `/api/moderation/polls/${poll.slug}`;
+  const base = { question: poll.question, options: ["One", "Two"] };
+  const first = await command(ownerPath, owner, "owner-content-revision-first", { ...base, category: "Food", expectedRevision: 0 }, "PATCH");
+  assert.equal(first.status, 200, await first.clone().text());
+  assert.equal((await first.json()).poll.contentRevision, 1);
+  const staleOwner = await command(ownerPath, owner, "owner-content-revision-stale", { ...base, category: "Career", expectedRevision: 0 }, "PATCH");
+  assert.equal(staleOwner.status, 409);
+  assert.equal((await staleOwner.json()).code, "POLL_CHANGED");
+  const staleStaff = await command(staffPath, staff, "staff-content-revision-stale", { ...base, category: "Education", note: "Correct the category", expectedRevision: 0 }, "PATCH");
+  assert.equal(staleStaff.status, 409);
+  assert.equal((await staleStaff.json()).code, "POLL_CHANGED");
+  assert.equal(await ModerationAction.countDocuments({}), 0);
+  let current = await Poll.findById(poll._id);
+  assert.equal(current.category, "Food");
+  assert.equal(current.contentRevision, 1);
+  const staffEdit = await command(staffPath, staff, "staff-content-revision-current", { ...base, category: "Education", note: "Correct the category", expectedRevision: 1 }, "PATCH");
+  assert.equal(staffEdit.status, 200, await staffEdit.clone().text());
+  assert.equal((await staffEdit.json()).poll.contentRevision, 2);
+  assert.equal((await command(ownerPath, owner, "owner-content-revision-after-staff", { ...base, category: "Career", expectedRevision: 1 }, "PATCH")).status, 409);
+  current = await Poll.findById(poll._id);
+  assert.equal(current.category, "Education");
+  assert.equal(current.contentRevision, 2);
+  assert.equal(await ModerationAction.countDocuments({}), 1);
+  const missing = await command(ownerPath, owner, "owner-content-revision-missing", { ...base, category: "Career" }, "PATCH");
+  assert.equal(missing.status, 400);
+});
+
+test("simultaneous staff edits from one revision commit only one winner", async () => {
+  const staff = await createUser("moderator");
+  await enrollFactor(staff);
+  const poll = await createPoll();
+  const path = `/api/moderation/polls/${poll.slug}`;
+  const edits = ["Food", "Career"].map((category, index) => command(path, staff,
+    `staff-content-revision-race-${index}`, { question: poll.question, category,
+      options: ["One", "Two"], note: "Independent content review", expectedRevision: 0 }, "PATCH"));
+  const responses = await Promise.all(edits);
+  assert.deepEqual(responses.map((response) => response.status).sort(), [200, 409]);
+  const loser = responses.find((response) => response.status === 409);
+  assert.equal((await loser.json()).code, "POLL_CHANGED");
+  assert.equal(await ModerationAction.countDocuments({}), 1);
+  assert.equal((await Poll.findById(poll._id)).contentRevision, 1);
+});
+
+test("reported edits reject stale revisions without resolving a report", async () => {
+  const staff = await createUser("moderator");
+  await enrollFactor(staff);
+  const poll = await createPoll();
+  const report = await Report.create({ pollSlug: poll.slug, reporterKey: "stale-report-test", reason: "spam" });
+  const direct = await command(`/api/moderation/polls/${poll.slug}`, staff,
+    "staff-direct-before-report-edit", { question: poll.question, category: "Food", options: ["One", "Two"],
+      note: "Correct the category", expectedRevision: 0 }, "PATCH");
+  assert.equal(direct.status, 200);
+  const reported = await command(`/api/moderation/reports/${report.id}/poll`, staff,
+    "staff-reported-stale-revision", { question: poll.question, category: "Education", options: ["One", "Two"],
+      note: "Review after another edit", expectedRevision: 0 }, "PATCH");
+  assert.equal(reported.status, 409);
+  assert.equal((await reported.json()).code, "POLL_CHANGED");
+  assert.equal((await Report.findById(report._id)).status, "pending");
+  assert.equal(await ModerationAction.countDocuments({}), 1);
+});
+
+test("legacy polls without a revision accept one guarded edit and gain revision one", async () => {
+  const owner = await createUser();
+  const poll = await createPoll(owner.id);
+  await database.collection("polls").updateOne({ _id: poll._id }, { $unset: { contentRevision: "" } });
+  const path = `/api/polls/${poll.slug}`;
+  const body = { question: poll.question, options: ["One", "Two"], category: "Food", expectedRevision: 0 };
+  const response = await command(path, owner, "owner-legacy-content-revision", body, "PATCH");
+  assert.equal(response.status, 200, await response.clone().text());
+  assert.equal((await response.json()).poll.contentRevision, 1);
+  assert.equal((await command(path, owner, "owner-legacy-content-stale", body, "PATCH")).status, 409);
 });
 
 test("account deletion preserves other moderators' attribution and clears both ID formats", async () => {
@@ -1323,7 +1402,7 @@ test("staff content writes recheck role, suspension, session and MFA after middl
     const gate = await pauseIdentityRead(staff.id);
     const pending = fetch(`${baseUrl}/api/moderation/polls/${poll.slug}`, {
       method: "PATCH", headers: { "Content-Type": "application/json", Cookie: staff.cookie },
-      body: JSON.stringify({ question: poll.question, category: "Food", options: ["One", "Two"], note: "Local concurrency check" }),
+      body: JSON.stringify({ question: poll.question, category: "Food", options: ["One", "Two"], note: "Local concurrency check", expectedRevision: 0 }),
     });
     try {
       await reached(gate.entered);

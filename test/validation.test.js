@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { createSlug, validatePoll } from "../src/validation.js";
+import { contentRevisionFilter, createSlug, validatePoll } from "../src/validation.js";
 
 test("normalizes a valid poll", () => {
   const result = validatePoll({
@@ -37,4 +37,15 @@ test("creates URL-safe unique slugs", () => {
 
   assert.match(first, /^kacchi-or-tehari-[a-f0-9]{12}$/);
   assert.notEqual(first, second);
+});
+
+test("edits require a safe content revision and include legacy polls without one", () => {
+  const poll = { question: "Which option?", category: "Tech", options: ["One", "Two"] };
+  assert.match(validatePoll(poll, { editing: true }).errors[0], /content revision/);
+  for (const expectedRevision of [-1, 1.5, Number.MAX_SAFE_INTEGER, "0", null]) {
+    assert.ok(validatePoll({ ...poll, expectedRevision }, { editing: true }).errors.length);
+  }
+  assert.equal(validatePoll({ ...poll, expectedRevision: 0 }, { editing: true }).value.expectedRevision, 0);
+  assert.deepEqual(contentRevisionFilter(0), { contentRevision: { $in: [0, null] } });
+  assert.deepEqual(contentRevisionFilter(2), { contentRevision: 2 });
 });

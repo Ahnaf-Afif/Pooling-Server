@@ -49,7 +49,7 @@ for staged promotion, read-only smoke checks, outage response and rollback limit
 - `GET /api/polls/:slug` — one poll
 - `POST /api/polls` — create a poll (verified account required)
 - `GET /api/polls/mine` — polls owned by the current account
-- `PATCH /api/polls/:slug` — edit an owned poll before its first vote
+- `PATCH /api/polls/:slug` — edit an owned poll before its first vote, with `expectedRevision`
 - `POST /api/polls/:slug/close` — stop new votes
 - `POST /api/polls/:slug/archive` — remove an owned poll from listings
 - `DELETE /api/polls/:slug` — soft-delete an owned poll
@@ -61,9 +61,9 @@ for staged promotion, read-only smoke checks, outage response and rollback limit
 - `GET /api/moderation/polls/:slug/history` — full retained poll history, including removed polls
 - `GET /api/moderation/users/:id/history` — administrator-only account action history
 - `GET /api/moderation/history` — administrator-only retained audit log, including anonymized actions
-- `GET/PATCH /api/moderation/polls/:slug` — load or edit any poll with a required audit reason
+- `GET/PATCH /api/moderation/polls/:slug` — load or edit any poll with a required audit reason and `expectedRevision`
 - `POST /api/moderation/reports/:id/notes` — add a private moderation note
-- `PATCH /api/moderation/reports/:id/poll` — edit reported content and resolve the report
+- `PATCH /api/moderation/reports/:id/poll` — edit reported content and resolve the report, with `expectedRevision`
 - `POST /api/moderation/reports/:id/remove-poll` — soft-delete the poll and resolve the report
 - `GET /api/moderation/users` — administrator-only, searchable account list
 - `PATCH /api/moderation/users/:id/role` — assign a persistent user, moderator, or admin role
@@ -73,6 +73,14 @@ for staged promotion, read-only smoke checks, outage response and rollback limit
 - `POST /api/moderation/users/:id/reactivate` — restore a suspended account
 
 Report decisions, content edits, role changes, suspensions, and reactivations are recorded in an internal audit history. Administrators cannot suspend themselves or change their own role through the dashboard, which prevents accidental lockout.
+
+Every poll content response includes `contentRevision` (starting at zero). Send
+that number as `expectedRevision` for any owner or staff content edit. A stale
+edit returns HTTP 409 with `code: "POLL_CHANGED"`; it does not overwrite content
+or resolve reports. Reload the poll and review the latest content before trying
+again. Existing documents without a revision are treated as revision zero and
+gain revision one on their first guarded edit. Deploy the frontend and backend
+edit contract together; older clients that omit the revision receive HTTP 400.
 
 ### Poll pagination and statistics
 

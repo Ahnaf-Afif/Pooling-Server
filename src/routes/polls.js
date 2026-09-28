@@ -7,7 +7,7 @@ import Poll from "../models/Poll.js";
 import Report from "../models/Report.js";
 import VoteReceipt from "../models/VoteReceipt.js";
 import { limitAccountReads, limitPollCreation, limitReports, limitWrites } from "../rate-limit.js";
-import { createSlug, validatePoll } from "../validation.js";
+import { contentRevisionFilter, createSlug, validatePoll } from "../validation.js";
 import { getVoterKey } from "../voter.js";
 import { paginatePolls, PaginationError } from "../services/poll-pagination.js";
 import { getPlatformStats } from "../services/platform-stats.js";
@@ -133,16 +133,17 @@ router.post("/", requireVerifiedUser, limitPollCreation, async (request, respons
 
 router.patch("/:slug", requireVerifiedUser, limitWrites, async (request, response, next) => {
   try {
-    const { errors, value } = validatePoll(request.body);
+    const { errors, value } = validatePoll(request.body, { editing: true });
     if (errors.length) return response.status(400).json({ message: errors[0], errors });
 
     const poll = await withIdentityTransaction(request.auth, (session) => Poll.findOneAndUpdate(
-      { ...ownerFilter(request), totalVotes: 0, status: activeStatus },
+      { ...ownerFilter(request), ...contentRevisionFilter(value.expectedRevision), totalVotes: 0, status: activeStatus },
       {
         $set: {
           question: value.question,
           category: value.category,
           options: value.options.map((label) => ({ label, votes: 0 })),
+          contentRevision: value.expectedRevision + 1,
         },
       },
       { returnDocument: "after", runValidators: true, session },
@@ -151,6 +152,9 @@ router.patch("/:slug", requireVerifiedUser, limitWrites, async (request, respons
 
     const existing = await Poll.findOne(ownerFilter(request));
     if (!existing) return response.status(404).json({ message: "Poll not found" });
+    if ((existing.contentRevision || 0) !== value.expectedRevision) {
+      return response.status(409).json({ code: "POLL_CHANGED", message: "This poll was edited after you opened it. Your draft has not been saved. Reload the latest version before editing again." });
+    }
     return response.status(409).json({
       message: existing.totalVotes > 0
         ? "A poll cannot be edited after voting has started"

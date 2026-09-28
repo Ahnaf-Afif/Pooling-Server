@@ -85,6 +85,7 @@ function makePoll({ totalVotes = 7 } = {}) {
     category: "Tech",
     creatorId: "poll-owner",
     totalVotes,
+    contentRevision: 0,
     status: "active",
     deletedAt: null,
     updatedAt: new Date("2026-01-01T00:00:00Z"),
@@ -237,6 +238,7 @@ test("locks semantic poll content after voting starts", async () => {
       category: "Tech",
       options: ["First", "Second"],
       note: "Removed unsafe wording",
+      expectedRevision: 0,
     }),
   });
   assert.equal(response.status, 409);
@@ -253,6 +255,7 @@ test("moderators can correct a category and resolve related pending reports", as
       category: "Education",
       options: ["One", "Two"],
       note: "Corrected the category",
+      expectedRevision: 0,
     }),
   });
   assert.equal(response.status, 200);
@@ -273,6 +276,7 @@ test("moderators can directly edit an unvoted poll with content snapshots", asyn
       category: "Tech",
       options: ["First", "Second"],
       note: "Corrected the unsafe title",
+      expectedRevision: 0,
     }),
   });
   assert.equal(response.status, 200);
