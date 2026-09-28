@@ -1478,6 +1478,18 @@ test("public read limits cover GET and HEAD, preserve liveness and do not leak c
   assert.equal((await fetch(`${baseUrl}/api/polls?stats=false`, { headers: { "X-Forwarded-For": "198.51.100.11" } })).status, 200);
 });
 
+test("rotating forwarded IPv6 addresses cannot bypass a full network read bucket", async () => {
+  await fillRateBucket("read", "ip6:2001:0db8:abcd:0042/64", 60_000, 600);
+  const sameNetwork = await fetch(`${baseUrl}/api/polls?stats=false`, {
+    headers: { "X-Forwarded-For": "2001:db8:abcd:42:ffff::9" },
+  });
+  assert.equal(sameNetwork.status, 429);
+  const otherNetwork = await fetch(`${baseUrl}/api/polls?stats=false`, {
+    headers: { "X-Forwarded-For": "2001:db8:abcd:43::9" },
+  });
+  assert.equal(otherNetwork.status, 200);
+});
+
 test("account export quota follows the account across networks and leaves other accounts available", async () => {
   const user = await createUser();
   const other = await createUser();

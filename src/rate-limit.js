@@ -1,11 +1,20 @@
 import { createHash } from "node:crypto";
+import ipaddr from "ipaddr.js";
 
 import RateBucket from "./models/RateBucket.js";
 import { getVoterKey } from "./voter.js";
 
 const MINUTE = 60_000;
 const hash = (value) => createHash("sha256").update(value).digest("hex");
-const network = (request) => `ip:${request.ip || "unknown"}`;
+export function networkIdentity(request) {
+  if (!request.ip || !ipaddr.isValid(request.ip)) return "ip:unknown";
+  const address = ipaddr.parse(request.ip);
+  if (address.kind() === "ipv4") return `ip:${address.toString()}`;
+  if (address.isIPv4MappedAddress()) return `ip:${address.toIPv4Address().toString()}`;
+  // One IPv6 network bucket for rotating privacy addresses within a /64.
+  return `ip6:${address.parts.slice(0, 4).map((part) => part.toString(16).padStart(4, "0")).join(":")}/64`;
+}
+const network = networkIdentity;
 const account = (request) => `user:${request.auth.user.id}`;
 const participant = (request, response) => `voter:${getVoterKey(request, response, request.auth)}`;
 const reads = ["GET", "HEAD"];

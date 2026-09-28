@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { afterEach, beforeEach, test } from "node:test";
 
 import RateBucket from "../src/models/RateBucket.js";
-import { createLimiter, limitAccountReads, limitPollCreation, limitReports, limitWrites } from "../src/rate-limit.js";
+import { createLimiter, limitAccountReads, limitPollCreation, limitReports, limitWrites, networkIdentity } from "../src/rate-limit.js";
 import { getVoterKey } from "../src/voter.js";
 
 const original = RateBucket.findOneAndUpdate;
@@ -51,6 +51,21 @@ test("shared counters reject excess requests with private retry headers and boun
   assert.equal(denied.headers["Cache-Control"], "private, no-store");
   assert.equal(calls[0].update.$setOnInsert.expiresAt.getTime(), 120_000);
   assert.ok(!calls[0].filter._id.includes("192.0.2.1"));
+});
+
+test("rotating IPv6 addresses share a /64 quota while separate networks stay independent", async () => {
+  const first = "2001:db8:abcd:42::1";
+  const rotated = "2001:0db8:abcd:0042:ffff::9";
+  const other = "2001:db8:abcd:43::1";
+  assert.equal(networkIdentity({ ip: first }), networkIdentity({ ip: rotated }));
+  assert.notEqual(networkIdentity({ ip: first }), networkIdentity({ ip: other }));
+  assert.equal(networkIdentity({ ip: "::ffff:192.0.2.1" }), networkIdentity({ ip: "192.0.2.1" }));
+  assert.equal(networkIdentity({ ip: "not-an-address" }), "ip:unknown");
+
+  const limit = limiter({ rules: [{ key: networkIdentity, max: 1 }] });
+  assert.equal((await attempt(limit, { ip: first })).allowed, true);
+  assert.equal((await attempt(limit, { ip: rotated })).statusCode, 429);
+  assert.equal((await attempt(limit, { ip: other })).allowed, true);
 });
 
 test("cached rejection avoids all counter writes and expires at the window boundary", async () => {
