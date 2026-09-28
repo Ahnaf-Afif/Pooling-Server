@@ -12,7 +12,8 @@ import { getVoterKey } from "../voter.js";
 import { paginatePolls, PaginationError } from "../services/poll-pagination.js";
 import { getPlatformStats } from "../services/platform-stats.js";
 import { recordVote, VoteError } from "../services/voting.js";
-import { withIdentityTransaction } from "../services/identity-transaction.js";
+import { IdentityError, withIdentityTransaction } from "../services/identity-transaction.js";
+import { withCommand } from "../services/commands.js";
 
 const router = Router();
 const notDeleted = { deletedAt: null };
@@ -106,7 +107,7 @@ router.post("/", requireVerifiedUser, limitPollCreation, async (request, respons
     const { errors, value } = validatePoll(request.body);
     if (errors.length) return response.status(400).json({ message: errors[0], errors });
 
-    const poll = await withIdentityTransaction(request.auth, async (session) => {
+    const poll = await withCommand(request, async (session) => {
       const [created] = await Poll.create([{
         slug: createSlug(value.question),
         question: value.question,
@@ -115,7 +116,15 @@ router.post("/", requireVerifiedUser, limitPollCreation, async (request, respons
         creatorId: request.auth.user.id,
       }], { session });
       return created;
+    }, {}, {
+      store: (created) => ({ pollSlug: created.slug }),
+      async restore(saved, session) {
+        const created = await Poll.findOne({ slug: saved.pollSlug, creatorId: request.auth.user.id, deletedAt: null }).session(session);
+        if (!created) throw new IdentityError("The previously created poll is no longer available", 404);
+        return created;
+      },
     });
+    response.set("Idempotency-Replayed", String(request.commandReplayed));
     return response.status(201).json({ poll });
   } catch (error) {
     return next(error);

@@ -127,6 +127,205 @@ function post(path, cookie, body = {}) {
   });
 }
 
+function command(path, user, key, body = {}, method = "POST") {
+  return fetch(`${baseUrl}${path}`, {
+    method, headers: { "Content-Type": "application/json", Origin: "http://localhost:3000", Cookie: user.cookie, "Idempotency-Key": key },
+    body: JSON.stringify(body),
+  });
+}
+
+const pollInput = { question: "Which option do you prefer?", category: "Tech", options: ["One", "Two"] };
+
+test("simultaneous create commands commit one poll and isolate the same key by account", async () => {
+  const owner = await createUser();
+  const key = "create-command-concurrent-001";
+  const responses = await Promise.all(Array.from({ length: 4 }, () => command("/api/polls", owner, key, pollInput)));
+  for (const response of responses) assert.equal(response.status, 201, await response.clone().text());
+  const polls = await Promise.all(responses.map(async (response) => (await response.json()).poll));
+  assert.equal(new Set(polls.map((poll) => poll.id)).size, 1);
+  assert.equal(responses.filter((response) => response.headers.get("Idempotency-Replayed") === "true").length, 3);
+  assert.equal(await Poll.countDocuments({}), 1);
+  for (const poll of polls) {
+    assert.equal(poll.creatorId, undefined);
+    assert.equal(poll._id, undefined);
+  }
+  const other = await createUser();
+  const response = await command("/api/polls", other, key, pollInput);
+  assert.equal(response.status, 201);
+  assert.notEqual((await response.json()).poll.id, polls[0].id);
+  assert.equal(await database.collection("commandreceipts").countDocuments({}), 2);
+});
+
+test("command fingerprints accept reordered fields, reject changed data and validate keys", async () => {
+  const owner = await createUser();
+  const key = "create-command-canonical-001";
+  assert.equal((await command("/api/polls", owner, key, pollInput)).status, 201);
+  const reordered = await command("/api/polls", owner, key, { options: pollInput.options, category: "Tech", question: pollInput.question });
+  assert.equal(reordered.status, 201);
+  assert.equal(reordered.headers.get("Idempotency-Replayed"), "true");
+  const conflict = await command("/api/polls", owner, key, { ...pollInput, category: "Food" });
+  assert.equal(conflict.status, 409);
+  assert.equal((await conflict.json()).code, "COMMAND_CONFLICT");
+  assert.equal((await command("/api/polls", owner, "short", pollInput)).status, 400);
+  assert.equal(await Poll.countDocuments({}), 1);
+  const receipt = await database.collection("commandreceipts").findOne({});
+  assert.deepEqual(Object.keys(receipt.result), ["pollSlug"]);
+  assert.equal(JSON.stringify(receipt).includes(pollInput.question), false);
+  assert.equal(JSON.stringify(receipt).includes(key), false);
+});
+
+test("receipt failures roll back business writes and permit a safe retry", async () => {
+  const owner = await createUser();
+  const { default: Receipt } = await import("../src/models/CommandReceipt.js");
+  const create = Receipt.create;
+  try {
+    Receipt.create = async () => { throw new Error("Injected command receipt failure"); };
+    assert.equal((await command("/api/polls", owner, "create-command-rollback-001", pollInput)).status, 500);
+    assert.equal(await Poll.countDocuments({}), 0);
+    assert.equal(await Receipt.countDocuments({}), 0);
+  } finally { Receipt.create = create; }
+  assert.equal((await command("/api/polls", owner, "create-command-rollback-001", pollInput)).status, 201);
+  assert.equal(await Poll.countDocuments({}), 1);
+});
+
+test("a failed staff receipt insert rolls back both content changes and their audit", async () => {
+  const staff = await createUser("moderator");
+  await enrollFactor(staff);
+  const poll = await createPoll();
+  const { default: Receipt } = await import("../src/models/CommandReceipt.js");
+  const create = Receipt.create;
+  const path = `/api/moderation/polls/${poll.slug}`;
+  const body = { ...pollInput, category: "Food", note: "Correct the category" };
+  try {
+    Receipt.create = async () => { throw new Error("Injected staff receipt failure"); };
+    assert.equal((await command(path, staff, "moderation-command-rollback", body, "PATCH")).status, 500);
+    assert.equal((await Poll.findById(poll._id)).category, "Tech");
+    assert.equal(await ModerationAction.countDocuments({}), 0);
+    assert.equal(await Receipt.countDocuments({}), 0);
+  } finally { Receipt.create = create; }
+  assert.equal((await command(path, staff, "moderation-command-rollback", body, "PATCH")).status, 200);
+  assert.equal(await ModerationAction.countDocuments({}), 1);
+});
+
+test("command expiry is enforced without waiting for TTL and deleted polls cannot be resurrected by replay", async () => {
+  const owner = await createUser();
+  const key = "create-command-expiry-001";
+  const first = await command("/api/polls", owner, key, pollInput);
+  const original = (await first.json()).poll;
+  await database.collection("commandreceipts").updateOne({ actorId: owner.id }, { $set: { expiresAt: new Date(0) } });
+  const second = await command("/api/polls", owner, key, pollInput);
+  const replacement = (await second.json()).poll;
+  assert.notEqual(original.id, replacement.id);
+  assert.equal(second.headers.get("Idempotency-Replayed"), "false");
+  await Poll.updateOne({ slug: replacement.id }, { $set: { deletedAt: new Date() } });
+  assert.equal((await command("/api/polls", owner, key, pollInput)).status, 404);
+  assert.equal(await Poll.countDocuments({}), 2);
+});
+
+test("staff note replays require current role, MFA and session and never duplicate the audit", async () => {
+  const staff = await createUser("moderator");
+  await enrollFactor(staff);
+  const poll = await createPoll();
+  const report = await Report.create({ pollSlug: poll.slug, reporterKey: "test-reporter", reason: "spam" });
+  const path = `/api/moderation/reports/${report.id}/notes`;
+  const key = "moderation-command-note-001";
+  const body = { note: "Reviewed the reported content" };
+  const results = await Promise.all(Array.from({ length: 4 }, () => command(path, staff, key, body)));
+  for (const response of results) assert.equal(response.status, 201, await response.clone().text());
+  assert.equal(await ModerationAction.countDocuments({}), 1);
+  assert.equal(await database.collection("commandreceipts").countDocuments({}), 1);
+  await database.collection("session").updateMany({ userId: staff._id }, { $set: { mfaVerifiedAt: new Date(0) } });
+  assert.equal((await command(path, staff, key, body)).status, 403);
+  await database.collection("session").updateMany({ userId: staff._id }, { $set: { mfaVerifiedAt: new Date() } });
+  await database.collection("user").updateOne({ _id: staff._id }, { $set: { role: "user" } });
+  assert.equal((await command(path, staff, key, body)).status, 403);
+  await database.collection("user").updateOne({ _id: staff._id }, { $set: { role: "moderator" } });
+  await database.collection("session").deleteMany({ userId: staff._id });
+  assert.equal((await command(path, staff, key, body)).status, 403);
+  assert.equal(await ModerationAction.countDocuments({}), 1);
+});
+
+test("every moderation command mapping replays without repeating its changes or audit", async () => {
+  const admin = await createUser("admin");
+  await enrollFactor(admin);
+  const owner = await createUser();
+  const poll = await createPoll(owner.id);
+  const report = await Report.create({ pollSlug: poll.slug, reporterKey: "mapping-reporter", reason: "spam" });
+  const reportPath = `/api/moderation/reports/${report.id}`;
+  const commands = [
+    [`/api/moderation/polls/${poll.slug}`, "PATCH", { question: poll.question, category: "Food", options: ["One", "Two"], note: "Correct the poll category" }],
+    [reportPath, "PATCH", { status: "dismissed", note: "No content violation found" }],
+    [`${reportPath}/notes`, "POST", { note: "Keep the review context" }],
+    [reportPath, "PATCH", { status: "pending", note: "Reopen for content review" }],
+    [`${reportPath}/poll`, "PATCH", { question: poll.question, category: "Tech", options: ["One", "Two"], note: "Correct the category again" }],
+    [reportPath, "PATCH", { status: "pending", note: "New policy evidence received" }],
+    [`${reportPath}/suspend-owner`, "POST", { note: "Repeated policy violations" }],
+    [`${reportPath}/remove-poll`, "POST", { note: "Remove the reported content" }],
+    [`/api/moderation/users/${owner.id}/role`, "PATCH", { role: "moderator" }],
+    [`/api/moderation/users/${owner.id}/suspend`, "POST", { note: "Repeated policy violations" }],
+    [`/api/moderation/users/${owner.id}/reactivate`, "POST", { note: "Independent review completed" }],
+  ];
+  for (const [index, [path, method, body]] of commands.entries()) {
+    const key = `moderation-command-mapping-${index}`;
+    const first = await command(path, admin, key, body, method);
+    assert.ok(first.ok, `${path}: ${await first.clone().text()}`);
+    const count = await ModerationAction.countDocuments({});
+    const repeated = await command(path, admin, key, body, method);
+    assert.equal(repeated.status, first.status, await repeated.clone().text());
+    assert.equal(repeated.headers.get("Idempotency-Replayed"), "true");
+    assert.deepEqual(await repeated.json(), await first.json(), path);
+    assert.equal(await ModerationAction.countDocuments({}), count, path);
+  }
+  assert.equal(await database.collection("commandreceipts").countDocuments({}), commands.length);
+});
+
+test("replaying an old role command does not overwrite a newer decision or revive a deleted account", async () => {
+  const admin = await createUser("admin");
+  await enrollFactor(admin);
+  const target = await createUser();
+  const path = `/api/moderation/users/${target.id}/role`;
+  const key = "moderation-command-role-001";
+  assert.equal((await command(path, admin, key, { role: "moderator" }, "PATCH")).status, 200);
+  assert.equal((await command(path, admin, "moderation-command-role-002", { role: "user" }, "PATCH")).status, 200);
+  const repeated = await command(path, admin, key, { role: "moderator" }, "PATCH");
+  assert.equal(repeated.status, 200);
+  assert.equal((await repeated.json()).user.role, "user");
+  assert.equal(await ModerationAction.countDocuments({}), 2);
+  // A real deletion removes references in other actors' command receipts.
+  const session = await (await auth.$context).internalAdapter.createSession(target.id, false);
+  target.cookie = `better-auth.session_token=${encodeURIComponent(`${session.token}.${await makeSignature(session.token, secret)}`)}`;
+  assert.equal((await post("/api/account/delete", target.cookie, { confirmation: "DELETE" })).status, 204);
+  assert.equal(await database.collection("commandreceipts").countDocuments({ "result.userId": target.id }), 0);
+  assert.equal((await command(path, admin, key, { role: "moderator" }, "PATCH")).status, 404);
+  assert.equal(await database.collection("user").countDocuments({ _id: target._id }), 0);
+});
+
+test("account export omits private command material and deletion removes authored receipts", async () => {
+  const owner = await createUser();
+  const key = "create-command-privacy-001";
+  assert.equal((await command("/api/polls", owner, key, pollInput)).status, 201);
+  const response = await fetch(`${baseUrl}/api/account/export`, { headers: { Cookie: owner.cookie } });
+  assert.equal(response.status, 200);
+  const exported = await response.json();
+  assert.equal(exported.recentCommands.length, 1);
+  assert.deepEqual(Object.keys(exported.recentCommands[0]).sort(), ["createdAt", "expiresAt", "operation"]);
+  assert.equal(JSON.stringify(exported).includes(key), false);
+  assert.equal((await post("/api/account/delete", owner.cookie, { confirmation: "DELETE" })).status, 204);
+  assert.equal(await database.collection("commandreceipts").countDocuments({ actorId: owner.id }), 0);
+});
+
+test("a browser command cannot silently switch accounts between preparation and submission", async () => {
+  const owner = await createUser();
+  const response = await fetch(`${baseUrl}/api/polls`, {
+    method: "POST", headers: { "Content-Type": "application/json", Cookie: owner.cookie,
+      "Idempotency-Key": "create-command-account-change", "X-Command-Actor": "previous-account" },
+    body: JSON.stringify(pollInput),
+  });
+  assert.equal(response.status, 409);
+  assert.equal((await response.json()).code, "ACCOUNT_CHANGED");
+  assert.equal(await Poll.countDocuments({}), 0);
+});
+
 test("account deletion preserves other moderators' attribution and clears both ID formats", async () => {
   const user = await createUser("moderator");
   const poll = await createPoll(user.id);

@@ -79,7 +79,7 @@ deletion removes their request and removes links to them as an approving admin.
 
 ## Release prerequisite
 
-Apply and verify index migration `2026-09-staff-history-v6` (which includes the
+Apply and verify index migration `2026-09-command-retries-v7` (which includes the
 recovery indexes introduced by `2026-09-account-recovery-v5`) against the intended
 database before deploying these routes. Promote matching frontend and backend
 versions. Preserve the existing `VOTER_SECRET` release prerequisite from

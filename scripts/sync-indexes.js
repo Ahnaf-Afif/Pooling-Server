@@ -9,9 +9,10 @@ import VoteReceipt from "../src/models/VoteReceipt.js";
 import AdminGuard from "../src/models/AdminGuard.js";
 import PlatformStats from "../src/models/PlatformStats.js";
 import RecoveryRequest from "../src/models/RecoveryRequest.js";
+import CommandReceipt from "../src/models/CommandReceipt.js";
 
-const models = [Poll, VoteReceipt, Report, ModerationAction, RateBucket, AdminGuard, PlatformStats, RecoveryRequest];
-const migrationId = "2026-09-staff-history-v6";
+const models = [Poll, VoteReceipt, Report, ModerationAction, RateBucket, AdminGuard, PlatformStats, RecoveryRequest, CommandReceipt];
+const migrationId = "2026-09-command-retries-v7";
 
 const nativeIndexes = {
   user: [

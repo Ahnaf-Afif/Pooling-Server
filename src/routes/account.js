@@ -9,6 +9,7 @@ import ModerationAction from "../models/ModerationAction.js";
 import Poll from "../models/Poll.js";
 import Report from "../models/Report.js";
 import RecoveryRequest from "../models/RecoveryRequest.js";
+import CommandReceipt from "../models/CommandReceipt.js";
 import VoteReceipt from "../models/VoteReceipt.js";
 import { limitAccountReads, limitExports, limitWrites } from "../rate-limit.js";
 import { getAccountVoterKey } from "../voter.js";
@@ -32,13 +33,14 @@ router.get("/export", requireRecentAuth, limitExports, async (request, response,
   try {
     const userId = request.auth.user.id;
     const voterKey = getAccountVoterKey(userId);
-    const [user, polls, votes, reports, moderationActions, recoveryRequest] = await Promise.all([
+    const [user, polls, votes, reports, moderationActions, recoveryRequest, recentCommands] = await Promise.all([
       AuthUser.findOne(accountFilter(userId)).select("name email emailVerified role createdAt").lean(),
       Poll.find({ creatorId: userId }).select("slug question category options totalVotes status createdAt updatedAt moderatedAt").sort({ createdAt: 1 }).lean(),
       VoteReceipt.find({ voterKey }).select("pollSlug optionId createdAt").sort({ createdAt: 1 }).lean(),
       Report.find({ reporterUserId: userId }).select("pollSlug reason details status createdAt reviewedAt").sort({ createdAt: 1 }).lean(),
       ModerationAction.find({ actorId: userId }).select("action pollSlug reportId targetUserId note changedFields createdAt").sort({ createdAt: 1 }).lean(),
       RecoveryRequest.findById(userId).select("requestId status createdAt expiresAt approvedAt -_id").lean(),
+      CommandReceipt.find({ actorId: userId, expiresAt: { $gt: new Date() } }).select("operation createdAt expiresAt -_id").lean(),
     ]);
     response.set("Cache-Control", "no-store");
     return response.json({
@@ -56,6 +58,7 @@ router.get("/export", requireRecentAuth, limitExports, async (request, response,
       reports,
       moderationActions,
       recoveryRequest,
+      recentCommands,
     });
   } catch (error) {
     return next(error);
@@ -105,6 +108,8 @@ router.post("/delete", requireRecentAuth, limitWrites, async (request, response,
       );
       await AuthSession.deleteMany({ userId: { $in: idCandidates(userId) } }, { session });
       await RecoveryRequest.deleteOne({ _id: userId }, { session });
+      await CommandReceipt.deleteMany({ actorId: userId }, { session });
+      await CommandReceipt.updateMany({ "result.userId": userId }, { $set: { "result.userId": null } }, { session });
       await RecoveryRequest.updateMany({ approvedBy: userId }, { $set: { approvedBy: null } }, { session });
       const database = getMongoDatabase();
       const userFilter = { userId: { $in: idCandidates(userId) } };

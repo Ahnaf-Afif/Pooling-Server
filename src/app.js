@@ -35,6 +35,7 @@ export function createApp(clientOrigins = getClientOrigins()) {
         return callback(new Error("Origin is not allowed"));
       },
       credentials: true,
+      exposedHeaders: ["Idempotency-Replayed", "X-Request-ID"],
       methods: ["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
     }),
   );

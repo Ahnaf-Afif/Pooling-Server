@@ -33,6 +33,8 @@ and preserve the existing data while investigating.
 5. Run `npm run db:indexes -- --verify` against the intended database. If it fails,
    review the migration and backup first; apply only the approved migration, then
    verify again. Build and smoke checks do not create/verify database indexes.
+   The current release requires `2026-09-command-retries-v7`, including its
+   command-receipt lookup/TTL indexes and all previous required indexes.
 
 `vercel.json` runs the same configuration/entrypoint check during the backend
 build, before runtime traffic. It does not contact MongoDB or send email and cannot
@@ -46,6 +48,8 @@ a missing runtime secret. The deployed smoke check remains necessary.
 
 1. Confirm both Vercel projects, environment and matching frontend/backend commits.
    Cursor contracts changed; do not pair older numbered-page clients with this API.
+   The new browser also requires command replay acknowledgements for creation
+   and moderation; promote it only with the matching command-enabled backend.
 2. Disable automatic domain assignment in the approved release setup. Vercel's
    `vercel deploy --prod --skip-domain` creates a production candidate without
    moving its production domains. This still uses production credentials: no

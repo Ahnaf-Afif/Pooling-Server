@@ -118,7 +118,7 @@ a poll before a previous cursor, so refresh to see the current ordering.
 **Release compatibility:** deploy the matching frontend and backend together
 behind a verified release process. An older frontend's `page=2` requests will
 fail against this API; an older backend does not provide the new cursors. Apply
-and verify migration `2026-09-staff-history-v6` before promotion, and preserve the
+and verify migration `2026-09-command-retries-v7` before promotion, and preserve the
 VOTER_SECRET prerequisite documented in SECRET-ROTATION.md. No production
 migration or deployment is implied by the local tests.
 
@@ -219,8 +219,40 @@ rejected signed-in write does not silently switch to a guest within the same
 request. Signing out can still enable a separate anonymous vote. Better Auth's
 own OAuth/session creation and authenticator enable/verify/disable flows are not
 made transactionally atomic by this guard; their deletion/concurrency boundaries
-remain separate work. General creation/moderation idempotency, scalable account
-cleanup and retained free-text privacy also remain open.
+remain separate work. Scalable account cleanup and retained free-text privacy
+also remain open.
+
+### Command retries
+
+Poll creation and custom moderation mutations accept an `Idempotency-Key` of
+20–128 letters, numbers, hyphens or underscores. Reuse the same key and JSON
+payload to retry an uncertain result within 24 hours. Keys are scoped to the
+authenticated account, method, route and parameters. Changed data returns 409;
+object field ordering does not matter. A receipt and its business/audit writes
+commit in one transaction. Replays still require current session, role and MFA
+authority; they never reapply an old decision over newer changes. Responses have
+`Idempotency-Replayed: true` or `false`. Returned entities reflect current state;
+removed targets return 404 rather than being recreated. Receipts store only
+references/counts and a keyed request fingerprint, not request/response copies.
+
+The matching frontend sends keys automatically and checks the acknowledgement
+and response shape. Its `X-Command-Actor` header rejects an account switch between
+preparation and submission. Legacy callers without keys remain supported, but
+do not get command replay protection. Owner edit/close/archive/delete and reports
+do not yet use this protocol; voting and recovery approval have their own retry
+semantics. Rate limits count attempts, including replays. A key reused after
+expiry can execute again; never treat it as permanent duplicate protection.
+
+The browser keeps up to 32 pending request digests/keys/timestamps in tab-scoped
+session storage, not raw content, account IDs or tokens. Failure retains the key;
+confirmed success clears it. Reloading and re-entering identical data in the same
+tab resumes it. The browser stops retries after 23 hours, on clock rollback, or
+when tracking storage is unavailable/corrupt/full. Check My Polls or staff history
+before starting a new request in a new tab. Closing the tab, clearing storage or
+changing the payload can create a new intent; this is not cross-device deduplication.
+No automatic write retries occur. Account deletion clears authored receipts and
+removes deleted account references from other receipts. Export exposes only the
+operation and timestamps. Migration v7 adds receipt expiry/lookup indexes.
 
 A poll is trending after at least three votes when its most recent vote was within seven days. Popular qualifying polls rank first, with recent activity breaking ties. Older records without an activity timestamp use their creation time during the transition.
 

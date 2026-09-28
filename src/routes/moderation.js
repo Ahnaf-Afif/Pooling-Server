@@ -2,7 +2,7 @@ import { Router } from "express";
 import mongoose from "mongoose";
 
 import { requireAdmin, requireModerator } from "../auth-middleware.js";
-import { withIdentityTransaction } from "../services/identity-transaction.js";
+import { withCommand } from "../services/commands.js";
 import ModerationAction from "../models/ModerationAction.js";
 import Poll from "../models/Poll.js";
 import Report from "../models/Report.js";
@@ -81,13 +81,42 @@ function cleanNote(body, { required = false, minimum = 1, maximum = 500 } = {}) 
   return { note };
 }
 
-function withStaffTransaction(request, work, role = "staff") {
-  return withIdentityTransaction(request.auth, (session, { user, effectiveRole }) => work(session, {
+async function withStaffTransaction(request, work, role = "staff", mapping) {
+  const result = await withCommand(request, (session, { user, effectiveRole }) => work(session, {
     actorId: String(user._id),
     actorName: (user.name || user.email || "Moderator").trim().slice(0, 160),
     actorRole: effectiveRole,
-  }), { role, adminChanges: role === "admin" });
+  }), { role, adminChanges: role === "admin" }, mapping);
+  request.res.set("Idempotency-Replayed", String(request.commandReplayed));
+  return result;
 }
+
+async function restoreAction(id, session) {
+  const action = await ModerationAction.findById(id).session(session).lean();
+  if (!action) throw new ModerationRequestError("The previous action is no longer available", 404);
+  return action;
+}
+
+const actionCommand = {
+  store: (action) => ({ actionId: String(action._id) }),
+  restore: (saved, session) => restoreAction(saved.actionId, session),
+};
+const userCommand = {
+  store: (user) => ({ userId: user.id }),
+  async restore(saved, session) {
+    const user = saved.userId && await findAuthUserById(saved.userId, { session });
+    if (!user) throw new ModerationRequestError("The previous target account is no longer available", 404);
+    return user;
+  },
+};
+const pollCommand = {
+  store: (result) => ({ pollSlug: result.updatedPoll.slug, actionId: String(result.action._id) }),
+  async restore(saved, session) {
+    const updatedPoll = await Poll.findOne({ slug: saved.pollSlug, deletedAt: null }).session(session);
+    if (!updatedPoll) throw new ModerationRequestError("The previously edited poll is no longer available", 404);
+    return { updatedPoll, action: await restoreAction(saved.actionId, session) };
+  },
+};
 
 function serializeAction(action) {
   return {
@@ -292,7 +321,7 @@ router.patch("/polls/:slug", limitWrites, async (request, response, next) => {
         after: update.after,
       }, session);
       return { ...update, action };
-    });
+    }, "staff", pollCommand);
     return response.json({
       message: "Poll changes saved",
       poll: serializePoll(result.updatedPoll),
@@ -400,7 +429,7 @@ router.post("/reports/:id/notes", limitWrites, async (request, response, next) =
         pollSlug: report.pollSlug,
         note,
       }, session);
-    });
+    }, "staff", actionCommand);
     return response.status(201).json({ action: serializeAction(action) });
   } catch (error) {
     return sendAdminError(error, response, next);
@@ -553,7 +582,7 @@ router.patch("/users/:id/role", requireAdmin, limitWrites, async (request, respo
         note: `Role changed from ${previousRole} to ${role}; active sessions revoked`,
       }, session);
       return updated;
-    }, "admin");
+    }, "admin", userCommand);
     return response.json({ user: serializeUser(user) });
   } catch (error) {
     return sendAdminError(error, response, next);
@@ -576,7 +605,7 @@ router.post("/users/:id/suspend", requireAdmin, limitWrites, async (request, res
         note,
       }, session);
       return updated;
-    }, "admin");
+    }, "admin", userCommand);
     return response.json({ user: serializeUser(user) });
   } catch (error) {
     return sendAdminError(error, response, next);
@@ -596,7 +625,7 @@ router.post("/users/:id/reactivate", requireAdmin, limitWrites, async (request, 
         note,
       }, session);
       return updated;
-    }, "admin");
+    }, "admin", userCommand);
     return response.json({ user: serializeUser(user) });
   } catch (error) {
     return sendAdminError(error, response, next);
