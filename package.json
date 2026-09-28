@@ -27,7 +27,7 @@
     "helmet": "^8.1.0",
     "ipaddr.js": "^1.9.1",
     "mongodb": "^7.6.0",
-    "mongoose": "^9.0.0"
+    "mongoose": "^9.10.2"
   },
   "devDependencies": {
     "mongodb-memory-server": "^10.4.3"
